@@ -6,10 +6,12 @@ import os
 import process
 import re
 import tempfile
+from typing import Any, Union
 
 _logger = logging.getLogger("cwltool")
 
 def get_image(dockerRequirement, pull_image, dry_run=False):
+    # type: (Dict[str,str], bool, bool) -> bool
     found = False
 
     if "dockerImageId" not in dockerRequirement and "dockerPull" in dockerRequirement:
@@ -36,7 +38,7 @@ def get_image(dockerRequirement, pull_image, dry_run=False):
                 subprocess.check_call(cmd, stdout=sys.stderr)
                 found = True
         elif "dockerFile" in dockerRequirement:
-            dockerfile_dir = tempfile.mkdtemp()
+            dockerfile_dir = str(tempfile.mkdtemp())
             with open(os.path.join(dockerfile_dir, "Dockerfile"), "w") as df:
                 df.write(dockerRequirement["dockerFile"])
             cmd = ["docker", "build", "--tag=%s" % dockerRequirement["dockerImageId"], dockerfile_dir]
@@ -77,6 +79,7 @@ def get_image(dockerRequirement, pull_image, dry_run=False):
 
 
 def get_from_requirements(r, req, pull_image, dry_run=False):
+    # type: (Dict[str,str], bool, bool, bool) -> Union[None,str]
     if r:
         errmsg = None
         try:

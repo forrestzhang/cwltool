@@ -11,13 +11,16 @@ import schema_salad.validate as validate
 import schema_salad.ref_resolver
 import sandboxjs
 import re
+from typing import Any, AnyStr, Union
 
 _logger = logging.getLogger("cwltool")
 
 def jshead(engineConfig, rootvars):
+    # type: (List[str],Dict[str,str]) -> str
     return "\n".join(engineConfig + ["var %s = %s;" % (k, json.dumps(v, indent=4)) for k, v in rootvars.items()])
 
 def exeval(ex, jobinput, requirements, outdir, tmpdir, context, pull_image):
+    # type: (Dict[str,Any], Dict[str,str], List[Dict[str, Any]], str, str, Any, bool) -> None
     if ex["engine"] == "https://w3id.org/cwl/cwl#JsonPointer":
         try:
             obj = {"job": jobinput, "context": context, "outdir": outdir, "tmpdir": tmpdir}
@@ -26,19 +29,29 @@ def exeval(ex, jobinput, requirements, outdir, tmpdir, context, pull_image):
             raise WorkflowException("%s in %s" % (v,  obj))
 
     if ex["engine"] == "https://w3id.org/cwl/cwl#JavascriptEngine":
-        engineConfig = []
+        engineConfig = []  # type: List[str]
         for r in reversed(requirements):
             if r["class"] == "ExpressionEngineRequirement" and r["id"] == "https://w3id.org/cwl/cwl#JavascriptEngine":
                 engineConfig = r.get("engineConfig", [])
                 break
-        return sandboxjs.execjs(ex["script"], jshead(engineConfig, jobinput, context, tmpdir, outdir))
+        rootvars = {
+            "inputs": jobinput,
+            "self": context,
+            "runtime": {
+                "tmpdir": tmpdir,
+                "outdir": outdir
+                }
+        }
+        return sandboxjs.execjs(ex["script"], jshead(engineConfig, rootvars))
 
     for r in reversed(requirements):
         if r["class"] == "ExpressionEngineRequirement" and r["id"] == ex["engine"]:
-            runtime = []
+            runtime = []  # type: List[str]
 
             class DR(object):
-                pass
+                def __init__(self):  # type: ()->None
+                    self.requirements = None  # type: List[None]
+                    self.hints = None  # type: List[None]
             dr = DR()
             dr.requirements = r.get("requirements", [])
             dr.hints = r.get("hints", [])
@@ -85,7 +98,7 @@ segments = r"(\.%s|%s|%s|%s)" % (seg_symbol, seg_single, seg_double, seg_index)
 segment_re = re.compile(segments, flags=re.UNICODE)
 param_re = re.compile(r"\$\((%s)%s*\)" % (seg_symbol, segments), flags=re.UNICODE)
 
-def next_seg(remain, obj):
+def next_seg(remain, obj):  # type: (str,Any)->str
     if remain:
         m = segment_re.match(remain)
         if m.group(0)[0] == '.':
@@ -99,7 +112,9 @@ def next_seg(remain, obj):
     else:
         return obj
 
+
 def param_interpolate(ex, obj, strip=True):
+    # type: (str, Dict[Any,Any], bool) -> Union[str, unicode]
     m = param_re.search(ex)
     if m:
         leaf = next_seg(m.group(0)[m.end(1) - m.start(0):-1], obj[m.group(1)])
@@ -118,6 +133,8 @@ def param_interpolate(ex, obj, strip=True):
 
 def do_eval(ex, jobinput, requirements, outdir, tmpdir, resources,
             context=None, pull_image=True, timeout=None):
+    # type: (Any, Dict[str,str], List[Dict[str,Any]], str, str, Dict[str,str], Any, bool, int) -> Any
+
     runtime = resources.copy()
     runtime["tmpdir"] = tmpdir
     runtime["outdir"] = outdir
@@ -135,5 +152,6 @@ def do_eval(ex, jobinput, requirements, outdir, tmpdir, resources,
             if r["class"] == "InlineJavascriptRequirement":
                 return sandboxjs.interpolate(ex, jshead(r.get("expressionLib", []), rootvars),
                                              timeout=timeout)
-        return param_interpolate(ex, rootvars)
-    return ex
+        return param_interpolate(str(ex), rootvars)
+    else:
+        return ex

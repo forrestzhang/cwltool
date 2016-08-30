@@ -1,27 +1,36 @@
 #!/usr/bin/env python
 
-import draft2tool
 import argparse
-from schema_salad.ref_resolver import Loader
 import json
 import os
 import sys
 import logging
-import workflow
-import schema_salad.validate as validate
+import copy
 import tempfile
+import ruamel.yaml as yaml
+import urlparse
+import hashlib
+import pkg_resources  # part of setuptools
+import functools
+
+import rdflib
+from typing import (Union, Any, AnyStr, cast, Callable, Dict, Sequence, Text,
+    Tuple, Type, IO)
+
+from schema_salad.ref_resolver import Loader
+import schema_salad.validate as validate
 import schema_salad.jsonld_context
 import schema_salad.makedoc
-import yaml
-import urlparse
-import process
-import job
-from cwlrdf import printrdf, printdot
-import pkg_resources  # part of setuptools
-import update
-from process import shortname
-import rdflib
-from aslist import aslist
+
+from . import workflow
+from .errors import WorkflowException, UnsupportedRequirement
+from .cwlrdf import printrdf, printdot
+from .process import shortname, Process, getListing, relocateOutputs, cleanIntermediate, scandeps, normalizeFilesDirs
+from .load_tool import fetch_document, validate_document, make_tool
+from . import draft2tool
+from .builder import adjustFileObjs, adjustDirObjs
+from .stdfsaccess import StdFsAccess
+from .pack import pack
 
 _logger = logging.getLogger("cwltool")
 
@@ -29,20 +38,21 @@ defaultStreamHandler = logging.StreamHandler()
 _logger.addHandler(defaultStreamHandler)
 _logger.setLevel(logging.INFO)
 
-def arg_parser():
+
+def arg_parser():  # type: () -> argparse.ArgumentParser
     parser = argparse.ArgumentParser(description='Reference executor for Common Workflow Language')
     parser.add_argument("--conformance-test", action="store_true")
-    parser.add_argument("--basedir", type=str)
-    parser.add_argument("--outdir", type=str, default=os.path.abspath('.'),
+    parser.add_argument("--basedir", type=Text)
+    parser.add_argument("--outdir", type=Text, default=os.path.abspath('.'),
                         help="Output directory, default current directory")
 
     parser.add_argument("--no-container", action="store_false", default=True,
                         help="Do not execute jobs in a Docker container, even when specified by the CommandLineTool",
                         dest="use_container")
 
-    parser.add_argument("--preserve-environment", type=str, nargs='+',
+    parser.add_argument("--preserve-environment", type=Text, nargs='+',
                         help="Preserve specified environment variables when running CommandLineTools",
-                        metavar=("VAR1","VAR2"),
+                        metavar=("VAR1,VAR2"),
                         default=("PATH",),
                         dest="preserve_environment")
 
@@ -55,13 +65,17 @@ def arg_parser():
                         default=True, help="Do not delete Docker container used by jobs after they exit",
                         dest="rm_container")
 
-    parser.add_argument("--tmpdir-prefix", type=str,
+    parser.add_argument("--tmpdir-prefix", type=Text,
                         help="Path prefix for temporary directories",
                         default="tmp")
 
-    parser.add_argument("--tmp-outdir-prefix", type=str,
+    exgroup = parser.add_mutually_exclusive_group()
+    exgroup.add_argument("--tmp-outdir-prefix", type=Text,
                         help="Path prefix for intermediate output directories",
                         default="tmp")
+
+    exgroup.add_argument("--cachedir", type=Text, default="",
+                        help="Directory to cache intermediate workflow outputs to avoid recomputing steps.")
 
     exgroup = parser.add_mutually_exclusive_group()
     exgroup.add_argument("--rm-tmpdir", action="store_true", default=True,
@@ -73,13 +87,17 @@ def arg_parser():
                         dest="rm_tmpdir")
 
     exgroup = parser.add_mutually_exclusive_group()
-    exgroup.add_argument("--move-outputs", action="store_true", default=True,
+    exgroup.add_argument("--move-outputs", action="store_const", const="move", default="move",
                         help="Move output files to the workflow output directory and delete intermediate output directories (default).",
                         dest="move_outputs")
 
-    exgroup.add_argument("--leave-outputs", action="store_false", default=True,
+    exgroup.add_argument("--leave-outputs", action="store_const", const="leave", default="move",
                         help="Leave output files in intermediate output directories.",
                         dest="move_outputs")
+
+    exgroup.add_argument("--copy-outputs", action="store_const", const="copy", default="move",
+                         help="Copy output files to the workflow output directory, don't delete intermediate output directories.",
+                         dest="move_outputs")
 
     exgroup = parser.add_mutually_exclusive_group()
     exgroup.add_argument("--enable-pull", default=True, action="store_true",
@@ -96,8 +114,9 @@ def arg_parser():
                         default="turtle")
 
     parser.add_argument("--eval-timeout",
-                        help="Time to wait for a Javascript expression to evaluate before giving an error.",
-                        type=float)
+                        help="Time to wait for a Javascript expression to evaluate before giving an error, default 20s.",
+                        type=float,
+                        default=20)
 
     exgroup = parser.add_mutually_exclusive_group()
     exgroup.add_argument("--print-rdf", action="store_true",
@@ -106,8 +125,8 @@ def arg_parser():
     exgroup.add_argument("--print-pre", action="store_true", help="Print CWL document after preprocessing.")
     exgroup.add_argument("--print-deps", action="store_true", help="Print CWL document dependencies.")
     exgroup.add_argument("--print-input-deps", action="store_true", help="Print input object document dependencies.")
+    exgroup.add_argument("--pack", action="store_true", help="Combine components into single document and print.")
     exgroup.add_argument("--version", action="store_true", help="Print version and exit")
-    exgroup.add_argument("--update", action="store_true", help="Update to latest CWL version, print and exit")
 
     exgroup = parser.add_mutually_exclusive_group()
     exgroup.add_argument("--strict", action="store_true", help="Strict validation (unrecognized or out of place fields are error)",
@@ -122,89 +141,159 @@ def arg_parser():
 
     parser.add_argument("--tool-help", action="store_true", help="Print command line help for tool")
 
-    parser.add_argument("--relative-deps", choices=['primary', 'cwd'], default="primary",
-                         help="When using --print-deps, print paths relative to primary file or current working directory.")
+    parser.add_argument("--relative-deps", choices=['primary', 'cwd'],
+        default="primary", help="When using --print-deps, print paths "
+        "relative to primary file or current working directory.")
 
-    parser.add_argument("--enable-net", action="store_true", help="Use docker's default network for container, default to disable network")
+    parser.add_argument("--enable-dev", action="store_true",
+                        help="Allow loading and running development versions "
+                        "of CWL spec.", default=False)
 
-    parser.add_argument("workflow", type=str, nargs="?", default=None)
+    parser.add_argument("--enable-net", action="store_true",
+                        help="Use docker's default networking for containers;"
+                        " the default is to disable networking.")
+    parser.add_argument("--custom-net", type=Text,
+                        help="Will be passed to `docker run` as the '--net' "
+                        "parameter. Implies '--enable-net'.")
+
+    parser.add_argument("--on-error", type=Text,
+                        help="Desired workflow behavior when a step fails.  One of 'stop' or 'continue'. "
+                        "Default is 'stop.", default="stop")
+
+    exgroup = parser.add_mutually_exclusive_group()
+    exgroup.add_argument("--compute-checksum", action="store_true", default=True,
+                        help="Compute checksum of contents while collecting outputs",
+                        dest="compute_checksum")
+    exgroup.add_argument("--no-compute-checksum", action="store_false",
+                        help="Do not compute checksum of contents while collecting outputs",
+                        dest="compute_checksum")
+
+    parser.add_argument("workflow", type=Text, nargs="?", default=None)
     parser.add_argument("job_order", nargs=argparse.REMAINDER)
 
     return parser
 
-def single_job_executor(t, job_order, input_basedir, args, **kwargs):
+
+def single_job_executor(t, job_order_object, **kwargs):
+    # type: (Process, Dict[Text, Any], **Any) -> Union[Text, Dict[Text, Text]]
     final_output = []
     final_status = []
 
     def output_callback(out, processStatus):
         final_status.append(processStatus)
         if processStatus == "success":
-            _logger.info("Final process status is %s", processStatus)
+            _logger.info(u"Final process status is %s", processStatus)
         else:
-            _logger.warn("Final process status is %s", processStatus)
+            _logger.warn(u"Final process status is %s", processStatus)
         final_output.append(out)
 
-    if kwargs.get("outdir"):
-        pass
-    elif kwargs.get("dry_run"):
-        kwargs["outdir"] = "/tmp"
-    else:
-        kwargs["outdir"] = tempfile.mkdtemp()
+    if "basedir" not in kwargs:
+        raise WorkflowException("Must provide 'basedir' in kwargs")
 
-    jobiter = t.job(job_order,
-                    input_basedir,
+    output_dirs = set()
+    finaloutdir = kwargs.get("outdir")
+    kwargs["outdir"] = tempfile.mkdtemp()
+    output_dirs.add(kwargs["outdir"])
+
+    jobReqs = None
+    if "cwl:requirements" in job_order_object:
+        jobReqs = job_order_object["cwl:requirements"]
+    elif ("cwl:defaults" in t.metadata and "cwl:requirements" in
+            t.metadata["cwl:defaults"]):
+        jobReqs = t.metadata["cwl:defaults"]["cwl:requirements"]
+    if jobReqs:
+        for req in jobReqs:
+            t.requirements.append(req)
+
+    jobiter = t.job(job_order_object,
                     output_callback,
                     **kwargs)
 
-    if kwargs.get("conformance_test"):
-        job = jobiter.next()
-        a = {"args": job.command_line}
-        if job.stdin:
-            a["stdin"] = job.pathmapper.mapper(job.stdin)[1]
-        if job.stdout:
-            a["stdout"] = job.stdout
-        if job.generatefiles:
-            a["createfiles"] = job.generatefiles
-        return a
-    else:
-        try:
-            for r in jobiter:
-                if r:
-                    r.run(**kwargs)
-                else:
-                    raise workflow.WorkflowException("Workflow cannot make any more progress.")
-        except workflow.WorkflowException:
-            raise
-        except Exception as e:
-            _logger.exception("Got workflow error")
-            raise workflow.WorkflowException("%s" % e, )
+    try:
+        for r in jobiter:
+            if r.outdir:
+                output_dirs.add(r.outdir)
 
-        if final_status[0] != "success":
-            raise workflow.WorkflowException("Process status is %s" % (final_status))
+            if r:
+                r.run(**kwargs)
+            else:
+                raise WorkflowException("Workflow cannot make any more progress.")
+    except WorkflowException:
+        raise
+    except Exception as e:
+        _logger.exception("Got workflow error")
+        raise WorkflowException(Text(e))
 
-        return final_output[0]
+    if final_status[0] != "success":
+        raise WorkflowException(u"Process status is %s" % (final_status))
+
+    if final_output[0] and finaloutdir:
+        final_output[0] = relocateOutputs(final_output[0], finaloutdir,
+                                          output_dirs, kwargs.get("move_outputs"))
+
+    if kwargs.get("rm_tmpdir"):
+        cleanIntermediate(output_dirs)
+
+    return final_output[0]
+
 
 class FileAction(argparse.Action):
+
     def __init__(self, option_strings, dest, nargs=None, **kwargs):
+        # type: (List[Text], Text, Any, **Any) -> None
         if nargs is not None:
             raise ValueError("nargs not allowed")
         super(FileAction, self).__init__(option_strings, dest, **kwargs)
+
     def __call__(self, parser, namespace, values, option_string=None):
-        setattr(namespace, self.dest, {"class": "File", "path": values})
+        # type: (argparse.ArgumentParser, argparse.Namespace, Union[AnyStr, Sequence[Any], None], AnyStr) -> None
+        setattr(namespace,
+            self.dest,  # type: ignore
+            {"class": "File",
+             "location": "file://%s" % os.path.abspath(cast(AnyStr, values))})
+
+
+class DirectoryAction(argparse.Action):
+
+    def __init__(self, option_strings, dest, nargs=None, **kwargs):
+        # type: (List[Text], Text, Any, **Any) -> None
+        if nargs is not None:
+            raise ValueError("nargs not allowed")
+        super(DirectoryAction, self).__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        # type: (argparse.ArgumentParser, argparse.Namespace, Union[AnyStr, Sequence[Any], None], AnyStr) -> None
+        setattr(namespace,
+            self.dest,  # type: ignore
+            {"class": "Directory",
+             "location": "file://%s" % os.path.abspath(cast(AnyStr, values))})
+
 
 class FileAppendAction(argparse.Action):
+
     def __init__(self, option_strings, dest, nargs=None, **kwargs):
+        # type: (List[Text], Text, Any, **Any) -> None
         if nargs is not None:
             raise ValueError("nargs not allowed")
         super(FileAppendAction, self).__init__(option_strings, dest, **kwargs)
+
     def __call__(self, parser, namespace, values, option_string=None):
-        g = getattr(namespace, self.dest)
+        # type: (argparse.ArgumentParser, argparse.Namespace, Union[AnyStr, Sequence[Any], None], AnyStr) -> None
+        g = getattr(namespace,
+                    self.dest  # type: ignore
+                    )
         if not g:
             g = []
-            setattr(namespace, self.dest, g)
-        g.append({"class": "File", "path": values})
+            setattr(namespace,
+                    self.dest,  # type: ignore
+                    g)
+        g.append(
+            {"class": "File",
+             "location": "file://%s" % os.path.abspath(cast(AnyStr, values))})
+
 
 def generate_parser(toolparser, tool, namemap):
+    # type: (argparse.ArgumentParser, Process, Dict[Text, Text]) -> argparse.ArgumentParser
     toolparser.add_argument("job_order", nargs="?", help="Job input json file")
     namemap["job_order"] = "job_order"
 
@@ -226,155 +315,70 @@ def generate_parser(toolparser, tool, namemap):
                 if len(inptype) == 2:
                     inptype = inptype[1]
                 else:
-                    _logger.debug("Can't make command line argument from %s", inptype)
+                    _logger.debug(u"Can't make command line argument from %s", inptype)
                     return None
 
-        help = inp.get("description", "").replace("%", "%%")
-        kwargs = {}
+        ahelp = inp.get("description", "").replace("%", "%%")
+        action = None  # type: Union[argparse.Action, Text]
+        atype = None  # type: Any
+        default = None  # type: Any
 
         if inptype == "File":
-            kwargs["action"] = FileAction
+            action = cast(argparse.Action, FileAction)
+        elif inptype == "Directory":
+            action = cast(argparse.Action, DirectoryAction)
         elif isinstance(inptype, dict) and inptype["type"] == "array":
             if inptype["items"] == "File":
-                kwargs["action"] = FileAppendAction
+                action = cast(argparse.Action, FileAppendAction)
             else:
-                kwargs["action"] = "append"
-
+                action = "append"
+        elif isinstance(inptype, dict) and inptype["type"] == "enum":
+            atype = Text
         if inptype == "string":
-            kwargs["type"] = str
+            atype = Text
         elif inptype == "int":
-            kwargs["type"] = int
+            atype = int
+        elif inptype == "double":
+            atype = float
         elif inptype == "float":
-            kwargs["type"] = float
+            atype = float
         elif inptype == "boolean":
-            kwargs["action"] = "store_true"
+            action = "store_true"
 
         if "default" in inp:
-            kwargs["default"] = inp["default"]
+            default = inp["default"]
             required = False
 
-        if "type" not in kwargs and "action" not in kwargs:
-            _logger.debug("Can't make command line argument from %s", inptype)
+        if not atype and not action:
+            _logger.debug(u"Can't make command line argument from %s", inptype)
             return None
 
-        toolparser.add_argument(flag + name, required=required, help=help, **kwargs)
+        if inptype != "boolean":
+            typekw = { 'type': atype }
+        else:
+            typekw = {}
+
+        toolparser.add_argument(  # type: ignore
+            flag + name, required=required, help=ahelp, action=action,
+            default=default, **typekw)
 
     return toolparser
 
 
-def load_tool(argsworkflow, updateonly, strict, makeTool, debug,
-              print_pre=False,
-              print_rdf=False,
-              print_dot=False,
-              print_deps=False,
-              relative_deps=False,
-              rdf_serializer=None,
-              stdout=sys.stdout,
-              urifrag=None):
-    (document_loader, avsc_names, schema_metadata) = process.get_schema()
-
-    if isinstance(avsc_names, Exception):
-        raise avsc_names
-
-    jobobj = None
-    if isinstance(argsworkflow, basestring):
-        split = urlparse.urlsplit(argsworkflow)
-        if split.scheme:
-            uri = argsworkflow
-        else:
-            uri = "file://" + os.path.abspath(argsworkflow)
-        fileuri, urifrag = urlparse.urldefrag(uri)
-        workflowobj = document_loader.fetch(fileuri)
-    elif isinstance(argsworkflow, dict):
-        workflowobj = argsworkflow
-        uri = urifrag
-        fileuri = "#"
-    else:
-        raise schema_salad.validate.ValidationException("Must be URI or dict")
-
-    if "cwl:tool" in workflowobj:
-        jobobj = workflowobj
-        uri = urlparse.urljoin(uri, jobobj["cwl:tool"])
-        fileuri, urifrag = urlparse.urldefrag(uri)
-        workflowobj = document_loader.fetch(fileuri)
-        del jobobj["cwl:tool"]
-
-    if isinstance(workflowobj, list):
-        # bare list without a version must be treated as draft-2
-        workflowobj = {"cwlVersion": "https://w3id.org/cwl/cwl#draft-2",
-                       "id": fileuri,
-                       "@graph": workflowobj}
-
-    workflowobj = update.update(workflowobj, document_loader, fileuri)
-    document_loader.idx.clear()
-
-    if updateonly:
-        stdout.write(json.dumps(workflowobj, indent=4))
-        return 0
-
-    if print_deps:
-        printdeps(workflowobj, document_loader, stdout, relative_deps)
-        return 0
-
-    try:
-        processobj, metadata = schema_salad.schema.load_and_validate(document_loader, avsc_names, workflowobj, strict)
-    except (schema_salad.validate.ValidationException, RuntimeError) as e:
-        _logger.error("Tool definition failed validation:\n%s", e, exc_info=(e if debug else False))
-        return 1
-
-    if print_pre:
-        stdout.write(json.dumps(processobj, indent=4))
-        return 0
-
-    if print_rdf:
-        printrdf(argsworkflow, processobj, document_loader.ctx, rdf_serializer, stdout)
-        return 0
-
-    if print_dot:
-        printdot(argsworkflow, processobj, document_loader.ctx, stdout)
-        return 0
-
-    if urifrag:
-        processobj, _ = document_loader.resolve_ref(uri)
-    elif isinstance(processobj, list):
-        if 1 == len(processobj):
-            processobj = processobj[0]
-        else:
-            _logger.error("Tool file contains graph of multiple objects, must specify one of #%s",
-                          ", #".join(urlparse.urldefrag(i["id"])[1]
-                                     for i in processobj if "id" in i))
-            return 1
-
-    try:
-        t = makeTool(processobj, strict=strict, makeTool=makeTool, loader=document_loader, avsc_names=avsc_names)
-    except (schema_salad.validate.ValidationException) as e:
-        _logger.error("Tool definition failed validation:\n%s", e, exc_info=(e if debug else False))
-        return 1
-    except (RuntimeError, workflow.WorkflowException) as e:
-        _logger.error("Tool definition failed initialization:\n%s", e, exc_info=(e if debug else False))
-        return 1
-
-    if jobobj:
-        for inp in t.tool["inputs"]:
-            if shortname(inp["id"]) in jobobj:
-                inp["default"] = jobobj[shortname(inp["id"])]
-
-    if metadata:
-        t.metadata = metadata
-    else:
-        t.metadata = {"$namespaces": t.tool.get("$namespaces", {}), "$schemas": t.tool.get("$schemas", [])}
-
-    return t
-
-
-def load_job_order(args, t, parser, stdin, print_input_deps=False, relative_deps=False, stdout=sys.stdout):
+def load_job_order(args, t, stdin, print_input_deps=False, relative_deps=False,
+                   stdout=sys.stdout, make_fs_access=None):
+    # type: (argparse.Namespace, Process, IO[Any], bool, bool, IO[Any], Type[StdFsAccess]) -> Union[int, Tuple[Dict[Text, Any], Text]]
 
     job_order_object = None
 
     if args.conformance_test:
         loader = Loader({})
     else:
-        jobloaderctx = {"path": {"@type": "@id"}, "format": {"@type": "@id"}, "id": "@id"}
+        jobloaderctx = {
+            u"path": {u"@type": u"@id"},
+            u"location": {u"@type": u"@id"},
+            u"format": {u"@type": u"@id"},
+            u"id": u"@id"}
         jobloaderctx.update(t.metadata.get("$namespaces", {}))
         loader = Loader(jobloaderctx)
 
@@ -391,14 +395,14 @@ def load_job_order(args, t, parser, stdin, print_input_deps=False, relative_deps
     elif job_order_file:
         input_basedir = args.basedir if args.basedir else os.path.abspath(os.path.dirname(job_order_file))
         try:
-            job_order_object, _ = loader.resolve_ref(job_order_file)
+            job_order_object, _ = loader.resolve_ref(job_order_file, checklinks=False)
         except Exception as e:
-            _logger.error(e, exc_info=(e if args.debug else False))
+            _logger.error(Text(e), exc_info=args.debug)
             return 1
         toolparser = None
     else:
         input_basedir = args.basedir if args.basedir else os.getcwd()
-        namemap = {}
+        namemap = {}  # type: Dict[Text, Text]
         toolparser = generate_parser(argparse.ArgumentParser(prog=args.workflow), t, namemap)
         if toolparser:
             if args.tool_help:
@@ -411,14 +415,14 @@ def load_job_order(args, t, parser, stdin, print_input_deps=False, relative_deps
                     input_basedir = args.basedir if args.basedir else os.path.abspath(os.path.dirname(cmd_line["job_order"]))
                     job_order_object = loader.resolve_ref(cmd_line["job_order"])
                 except Exception as e:
-                    _logger.error(e, exc_info=(e if args.debug else False))
+                    _logger.error(Text(e), exc_info=args.debug)
                     return 1
             else:
                 job_order_object = {"id": args.workflow}
 
             job_order_object.update({namemap[k]: v for k,v in cmd_line.items()})
 
-            _logger.debug("Parsed job order from command line: %s", json.dumps(job_order_object, indent=4))
+            _logger.debug(u"Parsed job order from command line: %s", json.dumps(job_order_object, indent=4))
         else:
             job_order_object = None
 
@@ -429,18 +433,28 @@ def load_job_order(args, t, parser, stdin, print_input_deps=False, relative_deps
             job_order_object[shortname(inp["id"])] = inp["default"]
 
     if not job_order_object and len(t.tool["inputs"]) > 0:
-        parser.print_help()
         if toolparser:
-            print "\nOptions for %s " % args.workflow
+            print u"\nOptions for %s " % args.workflow
             toolparser.print_help()
         _logger.error("")
-        _logger.error("Input object required")
+        _logger.error("Input object required, use --help for details")
         return 1
 
     if print_input_deps:
-        printdeps(job_order_object, loader, stdout, relative_deps,
-                  basedir="file://%s/" % input_basedir)
+        printdeps(job_order_object, loader, stdout, relative_deps, "",
+                  basedir=u"file://%s/" % input_basedir)
         return 0
+
+    def pathToLoc(p):
+        if "location" not in p and "path" in p:
+            p["location"] = p["path"]
+            del p["path"]
+
+    adjustDirObjs(job_order_object, pathToLoc)
+    adjustFileObjs(job_order_object, pathToLoc)
+    normalizeFilesDirs(job_order_object)
+    adjustDirObjs(job_order_object, cast(Callable[..., Any],
+        functools.partial(getListing, make_fs_access(input_basedir))))
 
     if "cwl:tool" in job_order_object:
         del job_order_object["cwl:tool"]
@@ -450,153 +464,252 @@ def load_job_order(args, t, parser, stdin, print_input_deps=False, relative_deps
     return (job_order_object, input_basedir)
 
 
-def printdeps(obj, document_loader, stdout, relative_deps, basedir=None):
+def printdeps(obj, document_loader, stdout, relative_deps, uri, basedir=None):
+    # type: (Dict[Text, Any], Loader, IO[Any], bool, Text, Text) -> None
     deps = {"class": "File",
-            "path": obj.get("id", "#")}
+            "location": uri}  # type: Dict[Text, Any]
 
     def loadref(b, u):
-        return document_loader.resolve_ref(u, base_url=b)[0]
+        return document_loader.fetch(urlparse.urljoin(b, u))
 
-    sf = process.scandeps(basedir if basedir else obj["id"], obj,
-                          set(("$import", "run")),
-                          set(("$include", "$schemas", "path")), loadref)
+    sf = scandeps(
+        basedir if basedir else uri, obj, set(("$import", "run")),
+        set(("$include", "$schemas", "path", "location")), loadref)
     if sf:
         deps["secondaryFiles"] = sf
 
     if relative_deps:
         if relative_deps == "primary":
-            base = basedir if basedir else os.path.dirname(obj["id"])
+            base = basedir if basedir else os.path.dirname(uri)
         elif relative_deps == "cwd":
             base = "file://" + os.getcwd()
         else:
-            raise Exception("Unknown relative_deps %s" % relative_deps)
-        def makeRelative(u):
+            raise Exception(u"Unknown relative_deps %s" % relative_deps)
+
+        def makeRelative(ob):
+            u = ob.get("location", ob.get("path"))
             if ":" in u.split("/")[0] and not u.startswith("file://"):
-                return u
-            return os.path.relpath(u, base)
-        process.adjustFiles(deps, makeRelative)
+                pass
+            else:
+                ob["location"] = os.path.relpath(u, base)
+        adjustFileObjs(deps, makeRelative)
 
     stdout.write(json.dumps(deps, indent=4))
 
+def print_pack(document_loader, processobj, uri, metadata):
+    # type: (Loader, Union[Dict[unicode, Any], List[Dict[unicode, Any]]], unicode, Dict[unicode, Any]) -> str
+    packed = pack(document_loader, processobj, uri, metadata)
+    if len(packed["$graph"]) > 1:
+        return json.dumps(packed, indent=4)
+    else:
+        return json.dumps(packed["$graph"][0], indent=4)
+
 def versionstring():
+    # type: () -> Text
     pkg = pkg_resources.require("cwltool")
     if pkg:
-        return "%s %s" % (sys.argv[0], pkg[0].version)
+        return u"%s %s" % (sys.argv[0], pkg[0].version)
     else:
-        return "%s %s" % (sys.argv[0], "unknown version")
+        return u"%s %s" % (sys.argv[0], "unknown version")
 
-def main(args=None,
+
+def main(argsl=None,
+         args=None,
          executor=single_job_executor,
          makeTool=workflow.defaultMakeTool,
          selectResources=None,
-         parser=None,
          stdin=sys.stdin,
          stdout=sys.stdout,
          stderr=sys.stderr,
-         versionfunc=versionstring):
+         versionfunc=versionstring,
+         job_order_object=None,
+         make_fs_access=StdFsAccess):
+    # type: (List[str], argparse.Namespace, Callable[..., Union[Text, Dict[Text, Text]]], Callable[..., Process], Callable[[Dict[Text, int]], Dict[Text, int]], IO[Any], IO[Any], IO[Any], Callable[[], Text], Union[int, Tuple[Dict[Text, Any], Text]], Type[StdFsAccess]) -> int
 
     _logger.removeHandler(defaultStreamHandler)
-    _logger.addHandler(logging.StreamHandler(stderr))
-
-    if args is None:
-        args = sys.argv[1:]
-
-    if parser is None:
-        parser = arg_parser()
-
-    args = parser.parse_args(args)
-
-    if args.quiet:
-        _logger.setLevel(logging.WARN)
-    if args.debug:
-        _logger.setLevel(logging.DEBUG)
-
-    if args.version:
-        print versionfunc()
-        return 0
-    else:
-        _logger.info(versionfunc())
-
-    if not args.workflow:
-        parser.print_help()
-        _logger.error("")
-        _logger.error("CWL document required")
-        return 1
-
+    stderr_handler = logging.StreamHandler(stderr)
+    _logger.addHandler(stderr_handler)
     try:
-        t = load_tool(args.workflow, args.update, args.strict, makeTool, args.debug,
-                      print_pre=args.print_pre,
-                      print_rdf=args.print_rdf,
-                      print_dot=args.print_dot,
-                      print_deps=args.print_deps,
-                      relative_deps=args.relative_deps,
-                      rdf_serializer=args.rdf_serializer,
-                      stdout=stdout)
-    except Exception as e:
-        _logger.error("I'm sorry, I couldn't load this CWL file, try again with --debug for more information.\n%s\n", e, exc_info=(e if args.debug else False))
-        return 1
+        if args is None:
+            if argsl is None:
+                argsl = sys.argv[1:]
+            args = arg_parser().parse_args(argsl)
 
-    if type(t) == int:
-        return t
+        # If caller provided custom arguments, it may be not every expected
+        # option is set, so fill in no-op defaults to avoid crashing when
+        # dereferencing them in args.
+        for k,v in {'print_deps': False,
+                    'print_pre': False,
+                    'print_rdf': False,
+                    'print_dot': False,
+                    'relative_deps': False,
+                    'tmp_outdir_prefix': 'tmp',
+                    'tmpdir_prefix': 'tmp',
+                    'print_input_deps': False,
+                    'cachedir': None,
+                    'quiet': False,
+                    'debug': False,
+                    'version': False,
+                    'enable_dev': False,
+                    'strict': True,
+                    'rdf_serializer': None,
+                    'basedir': None,
+                    'tool_help': False,
+                    'workflow': None,
+                    'job_order': None,
+                    'pack': False,
+                    'on_error': 'continue'}.iteritems():
+            if not hasattr(args, k):
+                setattr(args, k, v)
 
-    if args.tmp_outdir_prefix != 'tmp':
-        # Use user defined temp directory (if it exists)
-        args.tmp_outdir_prefix = os.path.abspath(args.tmp_outdir_prefix)
-        if not os.path.exists(args.tmp_outdir_prefix):
-            _logger.error("Intermediate output directory prefix doesn't exist, reverting to default")
-            return 1
+        if args.quiet:
+            _logger.setLevel(logging.WARN)
+        if args.debug:
+            _logger.setLevel(logging.DEBUG)
 
-    if args.tmpdir_prefix != 'tmp':
-        # Use user defined prefix (if the folder exists)
-        args.tmpdir_prefix = os.path.abspath(args.tmpdir_prefix)
-        if not os.path.exists(args.tmpdir_prefix):
-            _logger.error("Temporary directory prefix doesn't exist.")
-            return 1
-
-    job_order_object = load_job_order(args, t, parser, stdin,
-                                      print_input_deps=args.print_input_deps,
-                                      relative_deps=args.relative_deps,
-                                      stdout=stdout)
-
-    if type(job_order_object) == int:
-        return job_order_object
-
-    try:
-        out = executor(t, job_order_object[0],
-                       job_order_object[1], args,
-                       conformance_test=args.conformance_test,
-                       dry_run=args.dry_run,
-                       outdir=args.outdir,
-                       tmp_outdir_prefix=args.tmp_outdir_prefix,
-                       use_container=args.use_container,
-                       preserve_environment=args.preserve_environment,
-                       pull_image=args.enable_pull,
-                       rm_container=args.rm_container,
-                       tmpdir_prefix=args.tmpdir_prefix,
-                       enable_net=args.enable_net,
-                       rm_tmpdir=args.rm_tmpdir,
-                       makeTool=makeTool,
-                       move_outputs=args.move_outputs,
-                       select_resources=selectResources,
-                       eval_timeout=args.eval_timeout
-                       )
-        # This is the workflow output, it needs to be written
-        if out is not None:
-            stdout.write(json.dumps(out, indent=4))
-            stdout.flush()
+        if args.version:
+            print versionfunc()
+            return 0
         else:
-            return 1
-    except (validate.ValidationException) as e:
-        _logger.error("Input object failed validation:\n%s", e, exc_info=(e if args.debug else False))
-        return 1
-    except workflow.WorkflowException as e:
-        _logger.error("Workflow error, try again with --debug for more information:\n  %s", e, exc_info=(e if args.debug else False))
-        return 1
-    except Exception as e:
-        _logger.error("Unhandled error, try again with --debug for more information:\n  %s", e, exc_info=(e if args.debug else False))
-        return 1
+            _logger.info(versionfunc())
 
-    return 0
+        if not args.workflow:
+            _logger.error("")
+            _logger.error("CWL document required, try --help for details")
+            return 1
+
+        try:
+            document_loader, workflowobj, uri = fetch_document(args.workflow)
+
+            if args.print_deps:
+                printdeps(workflowobj, document_loader, stdout, args.relative_deps, uri)
+                return 0
+
+            document_loader, avsc_names, processobj, metadata, uri \
+                = validate_document(document_loader, workflowobj, uri,
+                                    enable_dev=args.enable_dev, strict=args.strict,
+                                    preprocess_only=args.print_pre or args.pack)
+
+            if args.pack:
+                stdout.write(print_pack(document_loader, processobj, uri, metadata))
+                return 0
+
+            if args.print_pre:
+                stdout.write(json.dumps(processobj, indent=4))
+                return 0
+
+            if args.print_rdf:
+                printrdf(uri, processobj, document_loader.ctx, args.rdf_serializer, stdout)
+                return 0
+
+            if args.print_dot:
+                printdot(uri, processobj, document_loader.ctx, stdout)
+                return 0
+
+            tool = make_tool(document_loader, avsc_names, metadata, uri,
+                    makeTool, {})
+        except (validate.ValidationException) as exc:
+            _logger.error(u"Tool definition failed validation:\n%s", exc,
+                          exc_info=args.debug)
+            return 1
+        except (RuntimeError, WorkflowException) as exc:
+            _logger.error(u"Tool definition failed initialization:\n%s", exc,
+                          exc_info=args.debug)
+            return 1
+        except Exception as exc:
+            _logger.error(
+                u"I'm sorry, I couldn't load this CWL file%s",
+                ", try again with --debug for more information.\nThe error was: "
+                "%s" % exc if not args.debug else ".  The error was:",
+                exc_info=args.debug)
+            return 1
+
+        if isinstance(tool, int):
+            return tool
+
+        if args.tmp_outdir_prefix != 'tmp':
+            # Use user defined temp directory (if it exists)
+            setattr(args, 'tmp_outdir_prefix',
+                    os.path.abspath(args.tmp_outdir_prefix))
+            if not os.path.exists(args.tmp_outdir_prefix):
+                _logger.error("Intermediate output directory prefix doesn't exist.")
+                return 1
+
+        if args.tmpdir_prefix != 'tmp':
+            # Use user defined prefix (if the folder exists)
+            setattr(args, 'tmpdir_prefix', os.path.abspath(args.tmpdir_prefix))
+            if not os.path.exists(args.tmpdir_prefix):
+                _logger.error("Temporary directory prefix doesn't exist.")
+                return 1
+
+        if job_order_object is None:
+            job_order_object = load_job_order(args, tool, stdin,
+                                              print_input_deps=args.print_input_deps,
+                                              relative_deps=args.relative_deps,
+                                              stdout=stdout,
+                                              make_fs_access=make_fs_access)
+
+        if isinstance(job_order_object, int):
+            return job_order_object
+
+        if args.cachedir:
+            setattr(args, 'cachedir', os.path.abspath(args.cachedir))
+            if args.move_outputs == "move":
+                setattr(args, 'move_outputs', "copy")
+
+        try:
+            setattr(args, 'tmp_outdir_prefix',
+                    args.cachedir if args.cachedir else args.tmp_outdir_prefix)
+            setattr(args, 'basedir', job_order_object[1])
+            del args.workflow
+            del args.job_order
+            out = executor(tool, job_order_object[0],
+                           makeTool=makeTool,
+                           select_resources=selectResources,
+                           make_fs_access=make_fs_access,
+                           **vars(args))
+
+            # This is the workflow output, it needs to be written
+            if out is not None:
+                def locToPath(p):
+                    if p["location"].startswith("file://"):
+                        p["path"] = p["location"][7:]
+
+                adjustDirObjs(out, locToPath)
+                adjustFileObjs(out, locToPath)
+
+                if isinstance(out, basestring):
+                    stdout.write(out)
+                else:
+                    stdout.write(json.dumps(out, indent=4))
+                stdout.write("\n")
+                stdout.flush()
+            else:
+                return 1
+        except (validate.ValidationException) as exc:
+            _logger.error(u"Input object failed validation:\n%s", exc,
+                    exc_info=args.debug)
+            return 1
+        except UnsupportedRequirement as exc:
+            _logger.error(
+                u"Workflow or tool uses unsupported feature:\n%s", exc,
+                exc_info=args.debug)
+            return 33
+        except WorkflowException as exc:
+            _logger.error(
+                u"Workflow error, try again with --debug for more "
+                "information:\n  %s", exc, exc_info=args.debug)
+            return 1
+        except Exception as exc:
+            _logger.error(
+                u"Unhandled error, try again with --debug for more information:\n"
+                "  %s", exc, exc_info=args.debug)
+            return 1
+
+        return 0
+    finally:
+        _logger.removeHandler(stderr_handler)
+        _logger.addHandler(defaultStreamHandler)
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))

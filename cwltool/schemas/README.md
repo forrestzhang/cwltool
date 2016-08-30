@@ -7,20 +7,29 @@ portability of data analysis workflows.  Our goal is to create specifications
 that enable data scientists to describe analysis tools and workflows that are
 powerful, easy to use, portable, and support reproducibility.
 
-CWL builds on technologies such as [JSON-LD](http://json-ld.org) and
-[Avro](https://avro.apache.org/) for data modeling and
-[Docker](http://docker.com) for portable runtime environments.
+CWL builds on technologies such as [JSON-LD](http://json-ld.org)
+for data modeling and [Docker](http://docker.com) for portable runtime\
+environments.
 
 CWL is designed to express workflows for data-intensive science, such as
 Bioinformatics, Medical Imaging, Chemistry, Physics, and Astronomy.
 
+## CWL User Guide
+
+[User guide for the current stable specification (v1.0)](http://www.commonwl.org/v1.0/UserGuide.html),
+provides a gentle introduction to writing CWL command line tool and workflow descriptions.
+
 ## CWL Specification
 
-The current stable specification is [draft 3](http://common-workflow-language.github.io/draft-3/):
+The current stable specification is [v1.0](http://www.commonwl.org/v1.0/):
 
-http://common-workflow-language.github.io/draft-3/
+http://www.commonwl.org/v1.0/
 
-Older drafts: [draft-1](https://github.com/common-workflow-language/common-workflow-language/tree/master/draft-1), [draft-2](http://common-workflow-language.github.io/draft-2/)
+Older drafts: [draft-1](https://github.com/common-workflow-language/common-workflow-language/tree/master/draft-1), [draft-2](http://www.commonwl.org/draft-2/), [draft-3](http://www.commonwl.org/draft-3/)
+
+### Citation
+
+Please cite https://dx.doi.org/10.6084/m9.figshare.3115156.v2
 
 ## Implementations
 
@@ -44,10 +53,25 @@ Some of the software supporting running Common Workflow Language tools or workfl
   [Airflow wiki page](https://github.com/common-workflow-language/common-workflow-language/wiki/SciDAP)
 * [cwl2script](https://github.com/common-workflow-language/cwl2script),
   [cwl2script page](https://github.com/common-workflow-language/common-workflow-language/wiki/cwl2script)
+* [Apache Taverna](http://taverna.incubator.apache.org/),
+  [Apache Taverna wiki page](https://github.com/common-workflow-language/common-workflow-language/wiki/Taverna)
+
+We continuously run the CWL conformance tests on several implementations:
+
+https://ci.commonwl.org
 
 ## Examples
 
 [Github repository of example tools and workflows.](https://github.com/common-workflow-language/workflows)
+
+## Support
+
+The best place to ask a question about all things CWL is on
+[Biostars](https://www.biostars.org/t/cwl/).
+
+[![Biostars
+CWL](https://www.biostars.org/static/biostar2.logo.png)](https://www.biostars.org/t/cwl/)
+</a>
 
 ## Development and testing
 
@@ -76,7 +100,7 @@ and send a pull request!
 [![Gitter](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/common-workflow-language/common-workflow-language?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
 Your CWL Community Engineer, Michael R. Crusoe, publishes a blog about his work
-with weekly updates at http://mrc.commonwl.org.
+with updates at http://mrc.commonwl.org.
 
 ### Code of Conduct
 
@@ -101,7 +125,6 @@ Conduct](https://github.com/common-workflow-language/common-workflow-language/bl
 * [Apache Taverna](http://taverna.incubator.apache.org/)
 * [Institut Pasteur](http://www.pasteur.fr)
 * [Wellcome Trust Sanger Institute](https://www.sanger.ac.uk/)
-* [University of California Davis](http://ucdavis.edu)
 * [University of California Santa Cruz](https://cbse.soe.ucsc.edu/research/bioinfo)
 * [Harvard Chan School of Public Health](http://www.hsph.harvard.edu/)
 * [Cincinnati Children's Hospital Medical Center](http://www.cincinnatichildrens.org/)
@@ -128,6 +151,7 @@ Conduct](https://github.com/common-workflow-language/common-workflow-language/bl
 * Maxim Mikheev <mikhmv@biodatomics.com>
 * Tim Pierce <twp@unchi.org>
 * Josh Randall <joshua.randall@sanger.ac.uk>
+* Janko Simonović <janko.simonovic@sbgenomics.com>
 * Stian Soiland-Reyes <soiland-reyes@cs.manchester.ac.uk>
 * Luka Stojanovic <luka.stojanovic@sbgenomics.com>
 * Nebojša Tijanić <nebojsa.tijanic@sbgenomics.com>

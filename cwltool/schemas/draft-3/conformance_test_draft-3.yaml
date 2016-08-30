@@ -1,63 +1,51 @@
-- args: [bwa, mem, -t, '4', -I, '1,2,3,4', -m, '3', draft-3/rabix/tests/test-files/chr20.fa,
-    draft-3/rabix/tests/test-files/example_human_Illumina.pe_1.fastq, draft-3/rabix/tests/test-files/example_human_Illumina.pe_2.fastq]
-  job: draft-3/bwa-mem-job.json
-  stdout: output.sam
+- job: draft-3/bwa-mem-job.json
   tool: draft-3/bwa-mem-tool.cwl
+  output:
+    args: [bwa, mem, -t, '4', -I, '1,2,3,4', -m, '3',
+      chr20.fa,
+      example_human_Illumina.pe_1.fastq,
+      example_human_Illumina.pe_2.fastq]
   doc: General test of command line generation
 
-- args: [bwa, mem, draft-3/rabix/tests/test-files/chr20.fa,
-    "-XXX",
-    "-YYY", draft-3/rabix/tests/test-files/example_human_Illumina.pe_1.fastq,
-    "-YYY", draft-3/rabix/tests/test-files/example_human_Illumina.pe_2.fastq]
+- output:
+    args: [bwa, mem, chr20.fa,
+      "-XXX",
+      "-YYY", example_human_Illumina.pe_1.fastq,
+      "-YYY", example_human_Illumina.pe_2.fastq]
   job: draft-3/bwa-mem-job.json
   tool: draft-3/binding-test.cwl
   doc: Test nested prefixes with arrays
 
-- args: [tmap, mapall, stage1, map1, --min-seq-length, '20', map2, --min-seq-length,
+- output:
+    args: [tmap, mapall, stage1, map1, --min-seq-length, '20', map2, --min-seq-length,
     '20', stage2, map1, --max-seq-length, '20', --min-seq-length, '10', --seed-length,
     '16', map2, --max-seed-hits, '-1', --max-seq-length, '20', --min-seq-length, '10']
   job: draft-3/tmap-job.json
-  stdin: draft-3/reads.fastq
-  stdout: output.sam
   tool: draft-3/tmap-tool.cwl
-  doc: Test nested command line bindings and stdin/stdout redirection
+  doc: Test nested command line bindings
 
-- args: [cat, draft-3/hello.txt]
+- output:
+    args: [cat, hello.txt]
   job: draft-3/cat-job.json
-  tool: draft-3/cat1-tool.cwl
+  tool: draft-3/cat1-testcli.cwl
   doc: Test command line with optional input (missing)
 
-- args: [cat, -n, draft-3/hello.txt]
+- output:
+    args: [cat, -n, hello.txt]
   job: draft-3/cat-n-job.json
-  tool: draft-3/cat1-tool.cwl
+  tool: draft-3/cat1-testcli.cwl
   doc: Test command line with optional input (provided)
 
-- args: [cat]
-  job: draft-3/cat-job.json
-  stdin: draft-3/hello.txt
-  tool: draft-3/cat2-tool.cwl
-  doc: Test command line with stdin redirection
-
-- args: [cat, draft-3/hello.txt]
-  job: draft-3/cat-job.json
-  stdout: output.txt
-  tool: draft-3/cat3-tool.cwl
-  doc: Test command line with stdout redirection
-
-- args: [cat]
-  job: draft-3/cat-job.json
-  stdin: draft-3/hello.txt
-  stdout: output.txt
-  tool: draft-3/cat4-tool.cwl
-  doc: Test command line with stdin and stdout redirection
-
-- args: [cat, foo.txt]
-  createfiles: {foo.txt: 'The file is draft-3/hello.txt
-
-      '}
+- output:
+    "foo": {
+        "checksum": "sha1$63da67422622fbf9251a046d7a34b7ea0fd4fead",
+        "class": "File",
+        "path": "foo.txt",
+        "size": 22
+    }
   job: draft-3/cat-job.json
   tool: draft-3/template-tool.cwl
-  doc: Test CreateFileRequirement ExpressionEngineRequirement.engineConfig features
+  doc: Test CreateFileRequirement ExpressionEngineRequirement.engineConfig feature
 
 - job: draft-3/cat-job.json
   output:
@@ -288,23 +276,33 @@
         "secondaryFiles": [
             {
                 "path": "input.txt.idx1",
-                "class": "File"
+                "class": "File",
+                "checksum": "sha1$553f3a09003a9f69623f03bec13c0b078d706023",
+                "size": 1500
             },
             {
                 "path": "input.idx2",
-                "class": "File"
+                "class": "File",
+                "checksum": "sha1$da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                "size": 0
             },
             {
                 "path": "input.txt.idx3",
-                "class": "File"
+                "class": "File",
+                "checksum": "sha1$da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                "size": 0
             },
             {
                 "path": "input.txt.idx4",
-                "class": "File"
+                "class": "File",
+                "checksum": "sha1$da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                "size": 0
             },
             {
                 "path": "input.txt.idx5",
-                "class": "File"
+                "class": "File",
+                "checksum": "sha1$da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                "size": 0
             }
         ],
         "size": 1111
@@ -504,7 +502,7 @@
   doc: |
     Test parameter evaluation, with support for JS expressions
 
-- args: [cat, draft-3/hello.txt]
+- output: {}
   job: draft-3/cat-job.json
   tool: draft-3/metadata.cwl
   doc: Test metadata
@@ -595,7 +593,9 @@
   output: {
     "foo": {
         "path": "foo",
-        "class": "File"
+        "class": "File",
+        "checksum": "sha1$f1d2d2f924e986ac86fdf7b36c94bcdf32beec15",
+        "size": 4
     }
   }
   tool: draft-3/test-cwl-out.cwl
@@ -623,3 +623,39 @@
     }]
   tool: draft-3/glob-expr-list.cwl
   doc: Test support for returning multiple glob patterns from expression
+
+- job: draft-3/scatter-valuefrom-job1.json
+  output:
+    out: ["foo one one", "foo one two", "foo one three", "foo one four"]
+  tool: draft-3/scatter-valuefrom-wf1.cwl
+  doc: Test workflow scatter with single scatter parameter and valueFrom on step input
+
+- job: draft-3/scatter-valuefrom-job2.json
+  output:
+    out: [["foo one one three", "foo one one four"], ["foo one two three", "foo one two four"]]
+  tool: draft-3/scatter-valuefrom-wf2.cwl
+  doc: Test workflow scatter with two scatter parameters and nested_crossproduct join method and valueFrom on step input
+
+- job: draft-3/scatter-valuefrom-job2.json
+  output:
+    out: ["foo one one three", "foo one one four", "foo one two three", "foo one two four"]
+  tool: "draft-3/scatter-valuefrom-wf3.cwl#main"
+  doc: Test workflow scatter with two scatter parameters and flat_crossproduct join method and valueFrom on step input
+
+- job: draft-3/scatter-valuefrom-job2.json
+  output:
+    out: ["foo one one three", "foo one two four"]
+  tool: "draft-3/scatter-valuefrom-wf4.cwl#main"
+  doc: Test workflow scatter with two scatter parameters and dotproduct join method and valueFrom on step input
+
+- job: draft-3/conflict-job.json
+  output: {
+    "fileout": {
+        "path": "out.txt",
+        "checksum": "sha1$a2d8d6e7b28295dc9977dc3bdb652ddd480995f0",
+        "class": "File",
+        "size": 25
+    }
+  }
+  tool: "draft-3/conflict-wf.cwl#collision"
+  doc: Test workflow two input files with same name.

@@ -1,46 +1,29 @@
 class: CommandLineTool
-requirements:
-  - class: ShellCommandRequirement
-  - class: InlineJavascriptRequirement
+cwlVersion: v1.0
 hints:
-  - class: DockerRequirement
+  DockerRequirement:
     dockerFile: |
       FROM debian:8
       RUN apt-get update && \
           DEBIAN_FRONTEND=noninteractive apt-get -yq install w3c-linkchecker \
     dockerImageId: commonworkflowlanguage/checklink
-
 inputs:
-  - id: inp
-    type:
-      type: array
-      items: File
-  - id: target
-    type: string
+  inp:
+    type: File
+    inputBinding: {position: 1}
+  target: string
 outputs:
-  - id: out
+  out:
     type: File
     outputBinding:
       glob: $(inputs.target)
-baseCommand: []
-arguments:
-  - "ln"
-  - "-s"
-  - valueFrom: $(inputs.inp)
-  - valueFrom: $(runtime.outdir)
-  - {valueFrom: ";", shellQuote: false}
-  - "checklink"
-  - "-X(http.*|mailto:.*)"
-  - "-q"
-  - valueFrom: |
-      ${
-        var r = [];
-        for (var i=0; i < inputs.inp.length; i++) {
-          r.push(inputs.inp[i].path.split('/').slice(-1)[0]);
-        }
-        return r;
-      }
-  - {valueFrom: " > ", shellQuote: false}
-  - valueFrom: $(inputs.target)
-  - {valueFrom: " && ! test -s", shellQuote: false}
-  - valueFrom: $(inputs.target)
+      loadContents: true
+      #outputEval: |
+      #  ${
+      #    return if (self.contents.length > 0) {
+      #
+      #    }
+      #  }
+baseCommand: checklink
+arguments: ["-X(http.*|mailto:.*)", "-q"]
+stdout: $(inputs.target)

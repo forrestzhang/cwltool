@@ -1,13 +1,13 @@
-cwlVersion: "cwl:draft-3.dev4"
+cwlVersion: v1.0
 class: Workflow
 
 inputs:
-  - {id: "#schema_in", type: string}
-  - {id: "#context_target", type: string}
-  - {id: "#rdfs_target", type: string}
+  schema_in: string
+  context_target: string
+  rdfs_target: string
 
 outputs:
-  - id: index_out
+  index_out:
     type: File
     source: "#doc/out"
 

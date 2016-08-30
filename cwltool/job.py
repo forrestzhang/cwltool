@@ -1,26 +1,31 @@
 import subprocess
+import io
 import os
 import tempfile
 import glob
 import json
-import yaml
 import logging
 import sys
 import requests
-import docker
-from process import get_feature, empty_subtree
-from errors import WorkflowException
+from . import docker
+from .process import get_feature, empty_subtree, stageFiles
+from .errors import WorkflowException
 import shutil
 import stat
 import re
 import shellescape
-from docker_uid import docker_vm_uid
+from .docker_uid import docker_vm_uid
+from .builder import Builder
+from typing import (Any, Callable, Union, Iterable, Mapping, MutableMapping,
+        IO, cast, Text, Tuple)
+from .pathmapper import PathMapper
+import functools
 
 _logger = logging.getLogger("cwltool")
 
 needs_shell_quoting_re = re.compile(r"""(^$|[\s|&;()<>\'"$@])""")
 
-def deref_links(outputs):
+def deref_links(outputs):  # type: (Any) -> None
     if isinstance(outputs, dict):
         if outputs.get("class") == "File":
             st = os.lstat(outputs["path"])
@@ -34,23 +39,51 @@ def deref_links(outputs):
             deref_links(v)
 
 class CommandLineJob(object):
-    def run(self, dry_run=False, pull_image=True, rm_container=True, rm_tmpdir=True, move_outputs=True, **kwargs):
+
+    def __init__(self):  # type: () -> None
+        self.builder = None  # type: Builder
+        self.joborder = None  # type: Dict[Text, Union[Dict[Text, Any], List, Text]]
+        self.stdin = None  # type: Text
+        self.stderr = None  # type: Text
+        self.stdout = None  # type: Text
+        self.successCodes = None  # type: Iterable[int]
+        self.temporaryFailCodes = None  # type: Iterable[int]
+        self.permanentFailCodes = None  # type: Iterable[int]
+        self.requirements = None  # type: List[Dict[Text, Text]]
+        self.hints = None  # type: Dict[Text,Text]
+        self.name = None  # type: Text
+        self.command_line = None  # type: List[Text]
+        self.pathmapper = None  # type: PathMapper
+        self.collect_outputs = None  # type: Union[Callable[[Any], Any], functools.partial[Any]]
+        self.output_callback = None  # type: Callable[[Any, Any], Any]
+        self.outdir = None  # type: Text
+        self.tmpdir = None  # type: Text
+        self.environment = None  # type: MutableMapping[Text, Text]
+        self.generatefiles = None  # type: Dict[Text, Union[List[Dict[Text, Text]], Dict[Text, Text], Text]]
+        self.stagedir = None  # type: Text
+
+    def run(self, dry_run=False, pull_image=True, rm_container=True,
+            rm_tmpdir=True, move_outputs="move", **kwargs):
+        # type: (bool, bool, bool, bool, bool, Text, **Any) -> Union[Tuple[Text, Dict[None, None]], None]
         if not os.path.exists(self.outdir):
             os.makedirs(self.outdir)
 
         #with open(os.path.join(outdir, "cwl.input.json"), "w") as fp:
         #    json.dump(self.joborder, fp)
 
-        runtime = []
-        env = {"TMPDIR": self.tmpdir}
+        runtime = []  # type: List[Text]
 
         (docker_req, docker_is_req) = get_feature(self, "DockerRequirement")
 
-        for f in self.pathmapper.files():
-            if not os.path.isfile(self.pathmapper.mapper(f)[0]):
-                raise WorkflowException("Required input file %s not found or is not a regular file." % self.pathmapper.mapper(f)[0])
+        for knownfile in self.pathmapper.files():
+            p = self.pathmapper.mapper(knownfile)
+            if p.type == "File" and not os.path.isfile(p[0]):
+                raise WorkflowException(
+                    u"Input file %s (at %s) not found or is not a regular "
+                    "file." % (knownfile, self.pathmapper.mapper(knownfile)[0]))
 
         img_id = None
+        env = None  # type: Union[MutableMapping[Text, Text], MutableMapping[str, str]]
         if docker_req and kwargs.get("use_container") is not False:
             env = os.environ
             img_id = docker.get_from_requirements(docker_req, docker_is_req, pull_image)
@@ -62,78 +95,110 @@ class CommandLineJob(object):
             runtime = ["docker", "run", "-i"]
             for src in self.pathmapper.files():
                 vol = self.pathmapper.mapper(src)
-                runtime.append("--volume=%s:%s:ro" % vol)
-            runtime.append("--volume=%s:%s:rw" % (os.path.abspath(self.outdir), "/var/spool/cwl"))
-            runtime.append("--volume=%s:%s:rw" % (os.path.abspath(self.tmpdir), "/tmp"))
-            runtime.append("--workdir=%s" % ("/var/spool/cwl"))
+                if vol.type == "File":
+                    runtime.append(u"--volume=%s:%s:ro" % (vol.resolved, vol.target))
+                if vol.type == "CreateFile":
+                    createtmp = os.path.join(self.stagedir, os.path.basename(vol.target))
+                    with open(createtmp, "w") as f:
+                        f.write(vol.resolved.encode("utf-8"))
+                    runtime.append(u"--volume=%s:%s:ro" % (createtmp, vol.target))
+            runtime.append(u"--volume=%s:%s:rw" % (os.path.realpath(self.outdir), "/var/spool/cwl"))
+            runtime.append(u"--volume=%s:%s:rw" % (os.path.realpath(self.tmpdir), "/tmp"))
+            runtime.append(u"--workdir=%s" % ("/var/spool/cwl"))
             runtime.append("--read-only=true")
-            if kwargs.get("enable_net") is not True:
+            if (kwargs.get("enable_net", None) is None and
+                    kwargs.get("custom_net", None) is not None):
                 runtime.append("--net=none")
+            elif kwargs.get("custom_net", None) is not None:
+                runtime.append("--net={0}".format(kwargs.get("custom_net")))
 
             if self.stdout:
                 runtime.append("--log-driver=none")
 
             euid = docker_vm_uid() or os.geteuid()
-            runtime.append("--user=%s" % (euid))
+            runtime.append(u"--user=%s" % (euid))
 
             if rm_container:
                 runtime.append("--rm")
 
             runtime.append("--env=TMPDIR=/tmp")
 
+            # spec currently says "HOME must be set to the designated output
+            # directory." but spec might change to designated temp directory.
+            # runtime.append("--env=HOME=/tmp")
+            runtime.append("--env=HOME=/var/spool/cwl")
+
             for t,v in self.environment.items():
-                runtime.append("--env=%s=%s" % (t, v))
+                runtime.append(u"--env=%s=%s" % (t, v))
 
             runtime.append(img_id)
         else:
             env = self.environment
             if not os.path.exists(self.tmpdir):
                 os.makedirs(self.tmpdir)
-            env["TMPDIR"] = self.tmpdir
             vars_to_preserve = kwargs.get("preserve_environment")
             if vars_to_preserve is not None:
                 for key, value in os.environ.items():
                     if key in vars_to_preserve and key not in env:
                         env[key] = value
+            env["HOME"] = self.outdir
+            env["TMPDIR"] = self.tmpdir
 
-        stdin = None
-        stdout = None
+            stageFiles(self.pathmapper, os.symlink)
 
-        scr, _  = get_feature(self, "ShellCommandRequirement")
+        stdin = None  # type: Union[IO[Any], int]
+        stderr = None  # type: IO[Any]
+        stdout = None  # type: IO[Any]
+
+        scr, _ = get_feature(self, "ShellCommandRequirement")
 
         if scr:
             shouldquote = lambda x: False
         else:
             shouldquote = needs_shell_quoting_re.search
 
-        _logger.info("[job %s] %s$ %s%s%s",
+        _logger.info(u"[job %s] %s$ %s%s%s%s",
                      self.name,
                      self.outdir,
-                     " ".join([shellescape.quote(str(arg)) if shouldquote(str(arg)) else str(arg) for arg in (runtime + self.command_line)]),
-                     ' < %s' % (self.stdin) if self.stdin else '',
-                     ' > %s' % os.path.join(self.outdir, self.stdout) if self.stdout else '')
+                     " \\\n    ".join([shellescape.quote(Text(arg)) if shouldquote(Text(arg)) else Text(arg) for arg in (runtime + self.command_line)]),
+                     u' < %s' % self.stdin if self.stdin else '',
+                     u' > %s' % os.path.join(self.outdir, self.stdout) if self.stdout else '',
+                     u' 2> %s' % os.path.join(self.outdir, self.stderr) if self.stderr else '')
 
         if dry_run:
             return (self.outdir, {})
 
-        outputs = {}
+        outputs = {}  # type: Dict[Text,Text]
 
         try:
-            for t in self.generatefiles:
-                if isinstance(self.generatefiles[t], dict):
-                    src = self.generatefiles[t]["path"]
-                    dst = os.path.join(self.outdir, t)
-                    if os.path.dirname(self.pathmapper.reversemap(src)[1]) != self.outdir:
-                        _logger.debug("symlinking %s to %s", dst, src)
-                        os.symlink(src, dst)
-                else:
-                    with open(os.path.join(self.outdir, t), "w") as f:
-                        f.write(self.generatefiles[t])
+            if self.generatefiles["listing"]:
+                generatemapper = PathMapper([self.generatefiles], self.outdir,
+                                            self.outdir, separateDirs=False)
+                _logger.debug(u"[job %s] initial work dir %s", self.name,
+                              json.dumps({p: generatemapper.mapper(p) for p in generatemapper.files()}, indent=4))
+
+                def linkoutdir(src, tgt):
+                    # Need to make the link to the staged file (may be inside
+                    # the container)
+                    for _, item in self.pathmapper.items():
+                        if src == item.resolved:
+                            os.symlink(item.target, tgt)
+                            break
+                stageFiles(generatemapper, linkoutdir)
 
             if self.stdin:
-                stdin = open(self.pathmapper.mapper(self.stdin)[0], "rb")
+                stdin = open(self.pathmapper.reversemap(self.stdin)[1], "rb")
             else:
                 stdin = subprocess.PIPE
+
+            if self.stderr:
+                abserr = os.path.join(self.outdir, self.stderr)
+                dnerr = os.path.dirname(abserr)
+                if dnerr and not os.path.exists(dnerr):
+                    os.makedirs(dnerr)
+                stderr = open(abserr, "wb")
+            else:
+                stderr = sys.stderr
 
             if self.stdout:
                 absout = os.path.join(self.outdir, self.stdout)
@@ -144,21 +209,25 @@ class CommandLineJob(object):
             else:
                 stdout = sys.stderr
 
-            sp = subprocess.Popen([str(x) for x in runtime + self.command_line],
+            sp = subprocess.Popen([Text(x).encode('utf-8') for x in runtime + self.command_line],
                                   shell=False,
                                   close_fds=True,
                                   stdin=stdin,
+                                  stderr=stderr,
                                   stdout=stdout,
                                   env=env,
                                   cwd=self.outdir)
 
-            if stdin == subprocess.PIPE:
+            if sp.stdin:
                 sp.stdin.close()
 
             rcode = sp.wait()
 
-            if stdin != subprocess.PIPE:
+            if isinstance(stdin, file):
                 stdin.close()
+
+            if stderr is not sys.stderr:
+                stderr.close()
 
             if stdout is not sys.stderr:
                 stdout.close()
@@ -174,44 +243,49 @@ class CommandLineJob(object):
             else:
                 processStatus = "permanentFail"
 
-            for t in self.generatefiles:
-                if isinstance(self.generatefiles[t], dict):
-                    src = self.generatefiles[t]["path"]
-                    dst = os.path.join(self.outdir, t)
-                    if os.path.dirname(self.pathmapper.reversemap(src)[1]) != self.outdir:
-                        os.remove(dst)
-                        os.symlink(self.pathmapper.reversemap(src)[1], dst)
+            if self.generatefiles["listing"]:
+                def linkoutdir(src, tgt):
+                    # Need to make the link to the staged file (may be inside
+                    # the container)
+                    if os.path.islink(tgt):
+                        os.remove(tgt)
+                        os.symlink(src, tgt)
+                stageFiles(generatemapper, linkoutdir, ignoreWritable=True)
 
             outputs = self.collect_outputs(self.outdir)
 
         except OSError as e:
             if e.errno == 2:
                 if runtime:
-                    _logger.error("'%s' not found", runtime[0])
+                    _logger.error(u"'%s' not found", runtime[0])
                 else:
-                    _logger.error("'%s' not found", self.command_line[0])
+                    _logger.error(u"'%s' not found", self.command_line[0])
             else:
                 _logger.exception("Exception while running job")
             processStatus = "permanentFail"
         except WorkflowException as e:
-            _logger.error("Error while running job: %s" % e)
+            _logger.error(u"Error while running job: %s" % e)
             processStatus = "permanentFail"
         except Exception as e:
             _logger.exception("Exception while running job")
             processStatus = "permanentFail"
 
         if processStatus != "success":
-            _logger.warn("[job %s] completed %s", self.name, processStatus)
+            _logger.warn(u"[job %s] completed %s", self.name, processStatus)
         else:
-            _logger.debug("[job %s] completed %s", self.name, processStatus)
-        _logger.debug("[job %s] %s", self.name, json.dumps(outputs, indent=4))
+            _logger.debug(u"[job %s] completed %s", self.name, processStatus)
+        _logger.debug(u"[job %s] %s", self.name, json.dumps(outputs, indent=4))
 
         self.output_callback(outputs, processStatus)
 
+        if self.stagedir and os.path.exists(self.stagedir):
+            _logger.debug(u"[job %s] Removing input staging directory %s", self.name, self.stagedir)
+            shutil.rmtree(self.stagedir, True)
+
         if rm_tmpdir:
-            _logger.debug("[job %s] Removing temporary directory %s", self.name, self.tmpdir)
+            _logger.debug(u"[job %s] Removing temporary directory %s", self.name, self.tmpdir)
             shutil.rmtree(self.tmpdir, True)
 
-        if move_outputs and empty_subtree(self.outdir):
-            _logger.debug("[job %s] Removing empty output directory %s", self.name, self.outdir)
+        if move_outputs == "move" and empty_subtree(self.outdir):
+            _logger.debug(u"[job %s] Removing empty output directory %s", self.name, self.outdir)
             shutil.rmtree(self.outdir, True)

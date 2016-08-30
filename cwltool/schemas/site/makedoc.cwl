@@ -1,38 +1,50 @@
-cwlVersion: "cwl:draft-3.dev4"
+cwlVersion: v1.0
 class: CommandLineTool
+requirements:
+  - class: InlineJavascriptRequirement
+    expressionLib:
+      - $include: cwlpath.js
 inputs:
-  - id: source
+  source:
     type: File
     inputBinding: {position: 1}
-  - id: renderlist
+  renderlist:
     type:
       - "null"
       - type: array
         items: string
         inputBinding: {prefix: "--only"}
     inputBinding: {position: 2}
-  - id: redirect
+  redirect:
     type:
       - "null"
       - type: array
         items: string
         inputBinding: {prefix: "--redirect"}
     inputBinding: {position: 2}
-  - id: brand
+  brand:
     type: string
     inputBinding: {prefix: "--brand"}
-  - id: brandlink
+  brandlink:
     type: string
     inputBinding: {prefix: "--brandlink"}
-  - id: target
+  target:
     type: string
-  - id: primtype
+  primtype:
     type: ["null", string]
     inputBinding: {prefix: "--primtype"}
 outputs:
-  - id: out
-    type: File
+  out: stdout
+  targetdir:
+    type: string
     outputBinding:
-      glob: $(inputs.target)
+      outputEval: |
+        ${
+          var m = inputs.target.match(/^([^/]+)\/[^/]/);
+          if (m)
+            return m[1];
+          else
+            return "";
+        }
 baseCommand: [python, "-mschema_salad.makedoc"]
 stdout: $(inputs.target)

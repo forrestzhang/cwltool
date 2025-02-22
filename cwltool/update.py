@@ -1,510 +1,371 @@
-import sys
-import urlparse
-import json
-import re
-import traceback
+import copy
+from collections.abc import MutableMapping, MutableSequence
+from functools import partial
+from typing import Callable, Optional, Union, cast
 
+from ruamel.yaml.comments import CommentedMap, CommentedSeq
+from schema_salad.exceptions import ValidationException
 from schema_salad.ref_resolver import Loader
-import schema_salad.validate
-from typing import Any, Callable, Dict, List, Text, Tuple, Union  # pylint: disable=unused-import
+from schema_salad.sourceline import SourceLine
 
-from .utils import aslist
+from .loghandler import _logger
+from .utils import CWLObjectType, CWLOutputType, aslist, visit_class, visit_field
 
-def findId(doc, frg):  # type: (Any, Any) -> Dict
-    if isinstance(doc, dict):
-        if "id" in doc and doc["id"] == frg:
-            return doc
-        else:
-            for d in doc:
-                f = findId(doc[d], frg)
-                if f:
-                    return f
-    if isinstance(doc, list):
-        for d in doc:
-            f = findId(d, frg)
-            if f:
-                return f
-    return None
 
-def fixType(doc):  # type: (Any) -> Any
-    if isinstance(doc, list):
-        return [fixType(f) for f in doc]
+def v1_2to1_3dev1(doc: CommentedMap, loader: Loader, baseuri: str) -> tuple[CommentedMap, str]:
+    """Public updater for v1.2 to v1.3.0-dev1."""
+    doc = copy.deepcopy(doc)
 
-    if isinstance(doc, (str, Text)):
-        if doc not in (
-                "null", "boolean", "int", "long", "float", "double", "string",
-                "File", "record", "enum", "array", "Any") and "#" not in doc:
-            return "#" + doc
-    return doc
+    def rewrite_loop_requirements(t: CWLObjectType) -> None:
+        for s in cast(MutableSequence[CWLObjectType], t["steps"]):
+            if "requirements" in s:
+                for i, r in enumerate(
+                    list(cast(MutableSequence[CWLObjectType], s["requirements"]))
+                ):
+                    cls = cast(str, r["class"])
+                    if cls == "http://commonwl.org/cwltool#Loop":
+                        if "when" in s:
+                            raise SourceLine(s, "when", ValidationException).makeError(
+                                "The `cwltool:Loop` clause is not compatible with the `when` directive."
+                            )
+                        if "loopWhen" not in r:
+                            raise SourceLine(
+                                r, raise_type=ValidationException
+                            ).makeError(  # pragma: no cover
+                                "The `loopWhen` clause is mandatory within the `cwltool:Loop` requirement."
+                            )
+                        s["when"] = r["loopWhen"]
+                        if "loop" in r:
+                            for el in cast(MutableSequence[CWLObjectType], r["loop"]):
+                                source = el.pop("loopSource", None)
+                                if source is not None:
+                                    el["outputSource"] = source
+                            s["loop"] = r["loop"]
+                        if "outputMethod" in r:
+                            if r["outputMethod"] == "all":
+                                s["outputMethod"] = "all_iterations"
+                            elif r["outputMethod"] == "last":
+                                s["outputMethod"] = "last_iteration"
+                            else:
+                                raise SourceLine(
+                                    r, raise_type=ValidationException
+                                ).makeError(  # pragma: no cover
+                                    f"Invalid value {r['outputMethod']} for `outputMethod`."
+                                )
+                        cast(
+                            MutableSequence[CWLObjectType],
+                            s["requirements"],
+                        ).pop(index=i)
+            if "hints" in s:
+                for r in cast(MutableSequence[CWLObjectType], s["hints"]):
+                    cls = cast(str, r["class"])
+                    if cls == "http://commonwl.org/cwltool#Loop":
+                        raise SourceLine(s["hints"], r, ValidationException).makeError(
+                            "http://commonwl.org/cwltool#Loop is valid only under requirements."
+                        )
 
-def _draft2toDraft3dev1(doc, loader, baseuri, update_steps=True):
-    # type: (Any, Loader, Text, bool) -> Any
-    try:
-        if isinstance(doc, dict):
-            if "import" in doc:
-                imp = urlparse.urljoin(baseuri, doc["import"])
-                impLoaded = loader.fetch(imp)
-                r = None  # type: Dict[Text, Any]
-                if isinstance(impLoaded, list):
-                    r = {"@graph": impLoaded}
-                elif isinstance(impLoaded, dict):
-                    r = impLoaded
+    visit_class(doc, "Workflow", rewrite_loop_requirements)
+    return doc, "v1.3.0-dev1"
+
+
+def v1_1to1_2(
+    doc: CommentedMap, loader: Loader, baseuri: str
+) -> tuple[CommentedMap, str]:  # pylint: disable=unused-argument
+    """Public updater for v1.1 to v1.2."""
+    doc = copy.deepcopy(doc)
+
+    upd: Union[CommentedSeq, CommentedMap] = doc
+    if isinstance(upd, MutableMapping) and "$graph" in upd:
+        upd = upd["$graph"]
+    for proc in aslist(upd):
+        if "cwlVersion" in proc:
+            del proc["cwlVersion"]
+
+    return doc, "v1.2"
+
+
+def v1_0to1_1(
+    doc: CommentedMap, loader: Loader, baseuri: str
+) -> tuple[CommentedMap, str]:  # pylint: disable=unused-argument
+    """Public updater for v1.0 to v1.1."""
+    doc = copy.deepcopy(doc)
+
+    rewrite = {
+        "http://commonwl.org/cwltool#WorkReuse": "WorkReuse",
+        "http://arvados.org/cwl#ReuseRequirement": "WorkReuse",
+        "http://commonwl.org/cwltool#TimeLimit": "ToolTimeLimit",
+        "http://commonwl.org/cwltool#NetworkAccess": "NetworkAccess",
+        "http://commonwl.org/cwltool#InplaceUpdateRequirement": "InplaceUpdateRequirement",
+        "http://commonwl.org/cwltool#LoadListingRequirement": "LoadListingRequirement",
+    }
+
+    def rewrite_requirements(t: CWLObjectType) -> None:
+        if "requirements" in t:
+            for r in cast(MutableSequence[CWLObjectType], t["requirements"]):
+                cls = cast(str, r["class"])
+                if cls in rewrite:
+                    r["class"] = rewrite[cls]
+        if "hints" in t:
+            for index, r in enumerate(cast(MutableSequence[CWLObjectType], t["hints"])):
+                if isinstance(r, MutableMapping):
+                    if "class" not in r:
+                        raise SourceLine(r, None, ValidationException).makeError(
+                            "'hints' entry missing required key 'class'."
+                        )
+                    cls = cast(str, r["class"])
+                    if cls in rewrite:
+                        r["class"] = rewrite[cls]
                 else:
-                    raise Exception("Unexpected code path.")
-                r["id"] = imp
-                _, frag = urlparse.urldefrag(imp)
-                if frag:
-                    frag = "#" + frag
-                    r = findId(r, frag)
-                return _draft2toDraft3dev1(r, loader, imp)
+                    raise SourceLine(t["hints"], index, ValidationException).makeError(
+                        f"'hints' entries must be dictionaries: {type(r)} {r}."
+                    )
+        if "steps" in t:
+            for s in cast(MutableSequence[CWLObjectType], t["steps"]):
+                rewrite_requirements(s)
 
-            if "include" in doc:
-                return loader.fetch_text(urlparse.urljoin(baseuri, doc["include"]))
-
-            for typename in ("type", "items"):
-                if typename in doc:
-                    doc[typename] = fixType(doc[typename])
-
-            if "steps" in doc and update_steps:
-                if not isinstance(doc["steps"], list):
-                    raise Exception("Value of 'steps' must be a list")
-                for i, s in enumerate(doc["steps"]):
-                    if "id" not in s:
-                        s["id"] = "step%i" % i
-                    for inp in s.get("inputs", []):
-                        if isinstance(inp.get("source"), list):
-                            if "requirements" not in doc:
-                                doc["requirements"] = []
-                            doc["requirements"].append({"class": "MultipleInputFeatureRequirement"})
-
-
-            for a in doc:
-                doc[a] = _draft2toDraft3dev1(doc[a], loader, baseuri)
-
-        if isinstance(doc, list):
-            return [_draft2toDraft3dev1(a, loader, baseuri) for a in doc]
-
-        return doc
-    except Exception as e:
-        err = json.dumps(doc, indent=4)
-        if "id" in doc:
-            err = doc["id"]
-        elif "name" in doc:
-            err = doc["name"]
-        raise Exception(u"Error updating '%s'\n  %s\n%s" % (err, e, traceback.format_exc()))
-
-def draft2toDraft3dev1(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Tuple[Any, Text]
-    return (_draft2toDraft3dev1(doc, loader, baseuri), "draft-3.dev1")
-
-digits = re.compile("\d+")
-
-def updateScript(sc):  # type: (Text) -> Text
-    sc = sc.replace("$job", "inputs")
-    sc = sc.replace("$tmpdir", "runtime.tmpdir")
-    sc = sc.replace("$outdir", "runtime.outdir")
-    sc = sc.replace("$self", "self")
-    return sc
-
-
-def _updateDev2Script(ent):  # type: (Any) -> Any
-    if isinstance(ent, dict) and "engine" in ent:
-        if ent["engine"] == "https://w3id.org/cwl/cwl#JsonPointer":
-            sp = ent["script"].split("/")
-            if sp[0] in ("tmpdir", "outdir"):
-                return u"$(runtime.%s)" % sp[0]
-            else:
-                if not sp[0]:
-                    sp.pop(0)
-                front = sp.pop(0)
-                sp = [Text(i) if digits.match(i) else "'"+i+"'"
-                      for i in sp]
-                if front == "job":
-                    return u"$(inputs[%s])" % ']['.join(sp)
-                elif front == "context":
-                    return u"$(self[%s])" % ']['.join(sp)
+    def update_secondaryFiles(
+        t: CWLOutputType, top: bool = False
+    ) -> Union[MutableSequence[MutableMapping[str, str]], MutableMapping[str, str]]:
+        if isinstance(t, CommentedSeq):
+            new_seq = copy.deepcopy(t)
+            for index, entry in enumerate(t):
+                new_seq[index] = update_secondaryFiles(entry)
+            return new_seq
+        elif isinstance(t, MutableSequence):
+            return CommentedSeq([update_secondaryFiles(cast(CWLOutputType, p)) for p in t])
+        elif isinstance(t, MutableMapping):
+            return cast(MutableMapping[str, str], t)
+        elif top:
+            return CommentedSeq([CommentedMap([("pattern", t)])])
         else:
-            sc = updateScript(ent["script"])
-            if sc[0] == "{":
-                return "$" + sc
-            else:
-                return u"$(%s)" % sc
-    else:
-        return ent
+            return CommentedMap([("pattern", t)])
 
+    def fix_inputBinding(t: CWLObjectType) -> None:
+        for i in cast(MutableSequence[CWLObjectType], t["inputs"]):
+            if "inputBinding" in i:
+                ib = cast(CWLObjectType, i["inputBinding"])
+                for k in list(ib.keys()):
+                    if k != "loadContents":
+                        _logger.warning(
+                            SourceLine(ib, k).makeError(
+                                "Will ignore field '{}' which is not valid in {} "
+                                "inputBinding".format(k, t["class"])
+                            )
+                        )
+                        del ib[k]
 
-def _draftDraft3dev1toDev2(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Any
-    doc = _updateDev2Script(doc)
-    if isinstance(doc, basestring):
-        return doc
+    visit_class(doc, ("CommandLineTool", "Workflow"), rewrite_requirements)
+    visit_class(doc, ("ExpressionTool", "Workflow"), fix_inputBinding)
+    visit_field(doc, "secondaryFiles", partial(update_secondaryFiles, top=True))
 
-    # Convert expressions
-    if isinstance(doc, dict):
-        if "@import" in doc:
-            resolved_doc = loader.resolve_ref(
-                doc["@import"], base_url=baseuri)[0]
-            if isinstance(resolved_doc, dict):
-                return _draftDraft3dev1toDev2(
-                    resolved_doc, loader, resolved_doc["id"])
-            else:
-                raise Exception("Unexpected codepath")
+    upd: Union[CommentedMap, CommentedSeq] = doc
+    if isinstance(upd, MutableMapping) and "$graph" in upd:
+        upd = upd["$graph"]
+    for proc in aslist(upd):
+        proc.setdefault("hints", CommentedSeq())
+        na = CommentedMap([("class", "NetworkAccess"), ("networkAccess", True)])
 
-        for a in doc:
-            doc[a] = _draftDraft3dev1toDev2(doc[a], loader, baseuri)
-
-        if "class" in doc and (doc["class"] in ("CommandLineTool", "Workflow", "ExpressionTool")):
-            added = False
-            if "requirements" in doc:
-                for r in doc["requirements"]:
-                    if r["class"] == "ExpressionEngineRequirement":
-                        if "engineConfig" in r:
-                            doc["requirements"].append({
-                                "class":"InlineJavascriptRequirement",
-                                "expressionLib": [updateScript(sc) for sc in aslist(r["engineConfig"])]
-                            })
-                            added = True
-                        doc["requirements"] = [rq for rq in doc["requirements"] if rq["class"] != "ExpressionEngineRequirement"]
-                        break
-            else:
-                doc["requirements"] = []
-            if not added:
-                doc["requirements"].append({"class":"InlineJavascriptRequirement"})
-
-    elif isinstance(doc, list):
-        return [_draftDraft3dev1toDev2(a, loader, baseuri) for a in doc]
-
-    return doc
-
-
-def draftDraft3dev1toDev2(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Tuple[Any, Text]
-    return (_draftDraft3dev1toDev2(doc, loader, baseuri), "draft-3.dev2")
-
-def _draftDraft3dev2toDev3(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Any
-    try:
-        if isinstance(doc, dict):
-            if "@import" in doc:
-                if doc["@import"][0] == "#":
-                    return doc["@import"]
-                else:
-                    imp = urlparse.urljoin(baseuri, doc["@import"])
-                    impLoaded = loader.fetch(imp)
-                    r = {}  # type: Dict[Text, Any]
-                    if isinstance(impLoaded, list):
-                        r = {"@graph": impLoaded}
-                    elif isinstance(impLoaded, dict):
-                        r = impLoaded
-                    else:
-                        raise Exception("Unexpected code path.")
-                    r["id"] = imp
-                    frag = urlparse.urldefrag(imp)[1]
-                    if frag:
-                        frag = "#" + frag
-                        r = findId(r, frag)
-                    return _draftDraft3dev2toDev3(r, loader, imp)
-
-            if "@include" in doc:
-                return loader.fetch_text(urlparse.urljoin(baseuri, doc["@include"]))
-
-            for a in doc:
-                doc[a] = _draftDraft3dev2toDev3(doc[a], loader, baseuri)
-
-        if isinstance(doc, list):
-            return [_draftDraft3dev2toDev3(a, loader, baseuri) for a in doc]
-
-        return doc
-    except Exception as e:
-        err = json.dumps(doc, indent=4)
-        if "id" in doc:
-            err = doc["id"]
-        elif "name" in doc:
-            err = doc["name"]
-        import traceback
-        raise Exception(u"Error updating '%s'\n  %s\n%s" % (err, e, traceback.format_exc()))
-
-def draftDraft3dev2toDev3(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Tuple[Any, Text]
-    return (_draftDraft3dev2toDev3(doc, loader, baseuri), "draft-3.dev3")
-
-
-def traverseImport(doc, loader, baseuri, func):
-    # type: (Any, Loader, Text, Callable[[Any, Loader, Text], Any]) -> Any
-    if "$import" in doc:
-        if doc["$import"][0] == "#":
-            return doc["$import"]
+        if hasattr(proc.lc, "filename"):
+            comment_filename = proc.lc.filename
         else:
-            imp = urlparse.urljoin(baseuri, doc["$import"])
-            impLoaded = loader.fetch(imp)
-            r = {}  # type: Dict[Text, Any]
-            if isinstance(impLoaded, list):
-                r = {"$graph": impLoaded}
-            elif isinstance(impLoaded, dict):
-                r = impLoaded
-            else:
-                raise Exception("Unexpected code path.")
-            r["id"] = imp
-            _, frag = urlparse.urldefrag(imp)
-            if frag:
-                frag = "#" + frag
-                r = findId(r, frag)
-            return func(r, loader, imp)
+            comment_filename = ""
+        na.lc.filename = comment_filename
+
+        proc["hints"].insert(0, na)
+
+        ll = CommentedMap([("class", "LoadListingRequirement"), ("loadListing", "deep_listing")])
+        ll.lc.filename = comment_filename
+        proc["hints"].insert(
+            0,
+            ll,
+        )
+        if "cwlVersion" in proc:
+            del proc["cwlVersion"]
+
+    return (doc, "v1.1")
 
 
-def _draftDraft3dev3toDev4(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Any
-    try:
-        if isinstance(doc, dict):
-            r = traverseImport(doc, loader, baseuri, _draftDraft3dev3toDev4)
-            if r is not None:
-                return r
-
-            if "@graph" in doc:
-                doc["$graph"] = doc["@graph"]
-                del doc["@graph"]
-
-            for a in doc:
-                doc[a] = _draftDraft3dev3toDev4(doc[a], loader, baseuri)
-
-        if isinstance(doc, list):
-            return [_draftDraft3dev3toDev4(a, loader, baseuri) for a in doc]
-
-        return doc
-    except Exception as e:
-        err = json.dumps(doc, indent=4)
-        if "id" in doc:
-            err = doc["id"]
-        elif "name" in doc:
-            err = doc["name"]
-        import traceback
-        raise Exception(u"Error updating '%s'\n  %s\n%s" % (err, e, traceback.format_exc()))
+def v1_1_0dev1to1_1(
+    doc: CommentedMap, loader: Loader, baseuri: str
+) -> tuple[CommentedMap, str]:  # pylint: disable=unused-argument
+    """Public updater for v1.1.0-dev1 to v1.1."""
+    return (doc, "v1.1")
 
 
-def draftDraft3dev3toDev4(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Tuple[Any, Text]
-    return (_draftDraft3dev3toDev4(doc, loader, baseuri), "draft-3.dev4")
-
-def _draftDraft3dev4toDev5(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Any
-    try:
-        if isinstance(doc, dict):
-            r = traverseImport(doc, loader, baseuri, _draftDraft3dev4toDev5)
-            if r is not None:
-                return r
-
-            for b in ("inputBinding", "outputBinding"):
-                if b in doc and "secondaryFiles" in doc[b]:
-                    doc["secondaryFiles"] = doc[b]["secondaryFiles"]
-                    del doc[b]["secondaryFiles"]
-
-            for a in doc:
-                doc[a] = _draftDraft3dev4toDev5(doc[a], loader, baseuri)
-
-        if isinstance(doc, list):
-            return [_draftDraft3dev4toDev5(a, loader, baseuri) for a in doc]
-
-        return doc
-    except Exception as e:
-        err = json.dumps(doc, indent=4)
-        if "id" in doc:
-            err = doc["id"]
-        elif "name" in doc:
-            err = doc["name"]
-        raise Exception(u"Error updating '%s'\n  %s\n%s" % (err, e, traceback.format_exc()))
+def v1_2_0dev1todev2(
+    doc: CommentedMap, loader: Loader, baseuri: str
+) -> tuple[CommentedMap, str]:  # pylint: disable=unused-argument
+    """Public updater for v1.2.0-dev1 to v1.2.0-dev2."""
+    return (doc, "v1.2.0-dev2")
 
 
-def draftDraft3dev4toDev5(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Tuple[Any, Text]
-    return (_draftDraft3dev4toDev5(doc, loader, baseuri), "draft-3.dev5")
+def v1_2_0dev2todev3(
+    doc: CommentedMap, loader: Loader, baseuri: str
+) -> tuple[CommentedMap, str]:  # pylint: disable=unused-argument
+    """Public updater for v1.2.0-dev2 to v1.2.0-dev3."""
+    doc = copy.deepcopy(doc)
 
-def draftDraft3dev5toFinal(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Tuple[Any, Text]
-    return (doc, "draft-3")
+    def update_pickvalue(t: CWLObjectType) -> None:
+        for step in cast(MutableSequence[CWLObjectType], t["steps"]):
+            for inp in cast(MutableSequence[CWLObjectType], step["in"]):
+                if "pickValue" in inp:
+                    if inp["pickValue"] == "only_non_null":
+                        inp["pickValue"] = "the_only_non_null"
 
-def _draft3toDraft4dev1(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Any
-    if isinstance(doc, dict):
-        if "class" in doc and doc["class"] == "Workflow":
-            def fixup(f):  # type: (Text) -> Text
-                doc, frg = urlparse.urldefrag(f)
-                frg = '/'.join(frg.rsplit('.', 1))
-                return doc + "#" + frg
-
-            for step in doc["steps"]:
-                step["in"] = step["inputs"]
-                step["out"] = step["outputs"]
-                del step["inputs"]
-                del step["outputs"]
-                for io in ("in", "out"):
-                    for i in step[io]:
-                        i["id"] = fixup(i["id"])
-                        if "source" in i:
-                            i["source"] = [fixup(s) for s in aslist(i["source"])]
-                            if len(i["source"]) == 1:
-                                i["source"] = i["source"][0]
-                if "scatter" in step:
-                    step["scatter"] = [fixup(s) for s in aslist(step["scatter"])]
-            for out in doc["outputs"]:
-                out["source"] = fixup(out["source"])
-        for key, value in doc.items():
-            doc[key] = _draft3toDraft4dev1(value, loader, baseuri)
-    elif isinstance(doc, list):
-        doc = [_draft3toDraft4dev1(item, loader, baseuri) for item in doc]
-
-    return doc
-
-def draft3toDraft4dev1(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Tuple[Any, Text]
-    """Public updater for draft-3 to draft-4.dev1."""
-    return (_draft3toDraft4dev1(doc, loader, baseuri), "draft-4.dev1")
-
-def _draft4Dev1toDev2(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Any
-    if isinstance(doc, dict):
-        if "class" in doc and doc["class"] == "Workflow":
-            for out in doc["outputs"]:
-                out["outputSource"] = out["source"]
-                del out["source"]
-        for key, value in doc.items():
-            doc[key] = _draft4Dev1toDev2(value, loader, baseuri)
-    elif isinstance(doc, list):
-        doc = [_draft4Dev1toDev2(item, loader, baseuri) for item in doc]
-
-    return doc
-
-def draft4Dev1toDev2(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Tuple[Any, Text]
-    """Public updater for draft-4.dev1 to draft-4.dev2."""
-    return (_draft4Dev1toDev2(doc, loader, baseuri), "draft-4.dev2")
+    visit_class(doc, "Workflow", update_pickvalue)
+    upd: Union[CommentedSeq, CommentedMap] = doc
+    if isinstance(upd, MutableMapping) and "$graph" in upd:
+        upd = upd["$graph"]
+    for proc in aslist(upd):
+        if "cwlVersion" in proc:
+            del proc["cwlVersion"]
+    return (doc, "v1.2.0-dev3")
 
 
-def _draft4Dev2toDev3(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Any
-    if isinstance(doc, dict):
-        if "class" in doc and doc["class"] == "File":
-            doc["location"] = doc["path"]
-            del doc["path"]
-        if "secondaryFiles" in doc:
-            for i, sf in enumerate(doc["secondaryFiles"]):
-                if "$(" in sf or "${" in sf:
-                    doc["secondaryFiles"][i] = sf.replace('"path"', '"location"').replace(".path", ".location")
+def v1_2_0dev3todev4(
+    doc: CommentedMap, loader: Loader, baseuri: str
+) -> tuple[CommentedMap, str]:  # pylint: disable=unused-argument
+    """Public updater for v1.2.0-dev3 to v1.2.0-dev4."""
+    return (doc, "v1.2.0-dev4")
 
-        if "class" in doc and doc["class"] == "CreateFileRequirement":
-            doc["class"] = "InitialWorkDirRequirement"
-            doc["listing"] = []
-            for f in doc["fileDef"]:
-                doc["listing"].append({
-                    "entryname": f["filename"],
-                    "entry": f["fileContent"]
-                })
-            del doc["fileDef"]
-        for key, value in doc.items():
-            doc[key] = _draft4Dev2toDev3(value, loader, baseuri)
-    elif isinstance(doc, list):
-        doc = [_draft4Dev2toDev3(item, loader, baseuri) for item in doc]
 
-    return doc
+def v1_2_0dev4todev5(
+    doc: CommentedMap, loader: Loader, baseuri: str
+) -> tuple[CommentedMap, str]:  # pylint: disable=unused-argument
+    """Public updater for v1.2.0-dev4 to v1.2.0-dev5."""
+    return (doc, "v1.2.0-dev5")
 
-def draft4Dev2toDev3(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Tuple[Any, Text]
-    """Public updater for draft-4.dev2 to draft-4.dev3."""
-    return (_draft4Dev2toDev3(doc, loader, baseuri), "draft-4.dev3")
 
-def _draft4Dev3to1_0dev4(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Any
-    if isinstance(doc, dict):
-        if "description" in doc:
-            doc["doc"] = doc["description"]
-            del doc["description"]
-        for key, value in doc.items():
-            doc[key] = _draft4Dev3to1_0dev4(value, loader, baseuri)
-    elif isinstance(doc, list):
-        doc = [_draft4Dev3to1_0dev4(item, loader, baseuri) for item in doc]
-    return doc
+def v1_2_0dev5to1_2(
+    doc: CommentedMap, loader: Loader, baseuri: str
+) -> tuple[CommentedMap, str]:  # pylint: disable=unused-argument
+    """Public updater for v1.2.0-dev5 to v1.2."""
+    return (doc, "v1.2")
 
-def draft4Dev3to1_0dev4(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Tuple[Any, Text]
-    """Public updater for draft-4.dev3 to v1.0.dev4."""
-    return (_draft4Dev3to1_0dev4(doc, loader, baseuri), "v1.0.dev4")
 
-def v1_0dev4to1_0(doc, loader, baseuri):
-    # type: (Any, Loader, Text) -> Tuple[Any, Text]
-    """Public updater for v1.0.dev4 to v1.0."""
-    return (doc, "v1.0")
+ORDERED_VERSIONS = [
+    "v1.0",
+    "v1.1.0-dev1",
+    "v1.1",
+    "v1.2.0-dev1",
+    "v1.2.0-dev2",
+    "v1.2.0-dev3",
+    "v1.2.0-dev4",
+    "v1.2.0-dev5",
+    "v1.2",
+    "v1.3.0-dev1",
+]
 
-UPDATES = {
-    "draft-2": draft2toDraft3dev1,
-    "draft-3": draft3toDraft4dev1,
-    "v1.0": None
-}  # type: Dict[Text, Callable[[Any, Loader, Text], Tuple[Any, Text]]]
+UPDATES: dict[str, Optional[Callable[[CommentedMap, Loader, str], tuple[CommentedMap, str]]]] = {
+    "v1.0": v1_0to1_1,
+    "v1.1": v1_1to1_2,
+    "v1.2": v1_2to1_3dev1,
+}
 
-DEVUPDATES = {
-    "draft-3.dev1": draftDraft3dev1toDev2,
-    "draft-3.dev2": draftDraft3dev2toDev3,
-    "draft-3.dev3": draftDraft3dev3toDev4,
-    "draft-3.dev4": draftDraft3dev4toDev5,
-    "draft-3.dev5": draftDraft3dev5toFinal,
-    "draft-4.dev1": draft4Dev1toDev2,
-    "draft-4.dev2": draft4Dev2toDev3,
-    "draft-4.dev3": draft4Dev3to1_0dev4,
-    "v1.0.dev4": v1_0dev4to1_0,
-    "v1.0": None
-}  # type: Dict[Text, Callable[[Any, Loader, Text], Tuple[Any, Text]]]
+DEVUPDATES: dict[str, Optional[Callable[[CommentedMap, Loader, str], tuple[CommentedMap, str]]]] = {
+    "v1.1.0-dev1": v1_1_0dev1to1_1,
+    "v1.2.0-dev1": v1_2_0dev1todev2,
+    "v1.2.0-dev2": v1_2_0dev2todev3,
+    "v1.2.0-dev3": v1_2_0dev3todev4,
+    "v1.2.0-dev4": v1_2_0dev4todev5,
+    "v1.2.0-dev5": v1_2_0dev5to1_2,
+    "v1.3.0-dev1": None,
+}
+
 
 ALLUPDATES = UPDATES.copy()
 ALLUPDATES.update(DEVUPDATES)
 
-LATEST = "v1.0"
+INTERNAL_VERSION = "v1.3.0-dev1"
 
-def identity(doc, loader, baseuri):  # pylint: disable=unused-argument
-    # type: (Any, Loader, Text) -> Tuple[Any, Union[Text, Text]]
-    """The default, do-nothing, CWL document upgrade function."""
-    return (doc, doc["cwlVersion"])
+ORIGINAL_CWLVERSION = "http://commonwl.org/cwltool#original_cwlVersion"
 
-def checkversion(doc, metadata, enable_dev):
-    # type: (Union[List[Dict[Text, Any]], Dict[Text, Any]], Dict[Text, Any], bool) -> Tuple[Dict[Text, Any], Text]  # pylint: disable=line-too-long
-    """Checks the validity of the version of the give CWL document.
+
+def identity(
+    doc: CommentedMap, loader: Loader, baseuri: str
+) -> tuple[CommentedMap, str]:  # pylint: disable=unused-argument
+    """Do-nothing, CWL document upgrade function."""
+    return (doc, cast(str, doc["cwlVersion"]))
+
+
+def checkversion(
+    doc: Union[CommentedSeq, CommentedMap],
+    metadata: CommentedMap,
+    enable_dev: bool,
+) -> tuple[CommentedMap, str]:
+    """Check the validity of the version of the give CWL document.
 
     Returns the document and the validated version string.
     """
-    if isinstance(doc, list):
-        metadata = metadata.copy()
-        metadata[u"$graph"] = doc
+    cdoc: Optional[CommentedMap] = None
+    if isinstance(doc, CommentedSeq):
+        if not isinstance(metadata, CommentedMap):
+            raise Exception("Expected metadata to be CommentedMap")
+        lc = metadata.lc
+        metadata = copy.deepcopy(metadata)
+        metadata.lc.data = copy.copy(lc.data)
+        metadata.lc.filename = lc.filename
+        metadata["$graph"] = doc
         cdoc = metadata
-    else:
+    elif isinstance(doc, CommentedMap):
         cdoc = doc
+    else:
+        raise Exception("Expected CommentedMap or CommentedSeq")
 
-    version = cdoc[u"cwlVersion"]
+    version = metadata["cwlVersion"]
+    cdoc["cwlVersion"] = version
 
-    if version not in UPDATES:
+    updated_from = metadata.get(ORIGINAL_CWLVERSION) or cdoc.get(ORIGINAL_CWLVERSION)
+
+    if updated_from:
+        if version != INTERNAL_VERSION:
+            raise ValidationException(
+                "original_cwlVersion is set (%s) but cwlVersion is '%s', expected '%s' "
+                % (updated_from, version, INTERNAL_VERSION)
+            )
+    elif version not in UPDATES:
         if version in DEVUPDATES:
             if enable_dev:
                 pass
             else:
-                raise schema_salad.validate.ValidationException(
-                    u"Version '%s' is a development or deprecated version.\n "
+                keys = list(UPDATES.keys())
+                keys.sort()
+                raise ValidationException(
+                    "Version '%s' is a development or deprecated version.\n "
                     "Update your document to a stable version (%s) or use "
                     "--enable-dev to enable support for development and "
-                    "deprecated versions." % (version, ", ".join(
-                        UPDATES.keys())))
+                    "deprecated versions." % (version, ", ".join(keys))
+                )
         else:
-            raise schema_salad.validate.ValidationException(
-                u"Unrecognized version %s" % version)
+            raise ValidationException("Unrecognized version %s" % version)
 
     return (cdoc, version)
 
-def update(doc, loader, baseuri, enable_dev, metadata):
-    # type: (Union[List[Dict[Text, Any]], Dict[Text, Any]], Loader, Text, bool, Any) -> Dict[Text, Any]
+
+def update(
+    doc: Union[CommentedSeq, CommentedMap],
+    loader: Loader,
+    baseuri: str,
+    enable_dev: bool,
+    metadata: CommentedMap,
+    update_to: Optional[str] = None,
+) -> CommentedMap:
+    """Update a CWL document to 'update_to' (if provided) or INTERNAL_VERSION."""
+    if update_to is None:
+        update_to = INTERNAL_VERSION
 
     (cdoc, version) = checkversion(doc, metadata, enable_dev)
+    originalversion = copy.copy(version)
 
-    nextupdate = identity  # type: Callable[[Any, Loader, Text], Tuple[Any, Text]]
+    nextupdate: Optional[Callable[[CommentedMap, Loader, str], tuple[CommentedMap, str]]] = identity
 
-    while nextupdate:
+    while version != update_to and nextupdate:
         (cdoc, version) = nextupdate(cdoc, loader, baseuri)
         nextupdate = ALLUPDATES[version]
 
-    cdoc[u"cwlVersion"] = version
+    cdoc["cwlVersion"] = version
+    metadata["cwlVersion"] = version
+    metadata[ORIGINAL_CWLVERSION] = originalversion
+    cdoc[ORIGINAL_CWLVERSION] = originalversion
 
     return cdoc

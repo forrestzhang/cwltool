@@ -1,0 +1,309 @@
+name: CI Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  TOX_SKIP_MISSING_INTERPRETERS: False
+  # Rich (pip)
+  FORCE_COLOR: 1
+  # Tox
+  PY_COLORS: 1
+  # Mypy (see https://github.com/python/mypy/issues/7771)
+  TERM: xterm-color
+  MYPY_FORCE_COLOR: 1
+  MYPY_FORCE_TERMINAL_WIDTH: 200
+  # Pytest
+  PYTEST_ADDOPTS: --color=yes
+
+jobs:
+
+  tox:
+    name: Tox
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        py-ver-major: [3]
+        py-ver-minor: [9, 10, 11, 12, 13]
+        step: [lint, unit, bandit, mypy]
+
+    env:
+      py-semver: ${{ format('{0}.{1}', matrix.py-ver-major, matrix.py-ver-minor) }}
+      TOXENV: ${{ format('py{0}{1}-{2}', matrix.py-ver-major, matrix.py-ver-minor, matrix.step) }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Singularity and environment-modules
+        if: ${{ matrix.step == 'unit' || matrix.step == 'mypy' }}
+        run: |
+          wget --no-verbose https://github.com/sylabs/singularity/releases/download/v4.2.1/singularity-ce_4.2.1-focal_amd64.deb
+          sudo apt-get install -y ./singularity-ce_4.2.1-focal_amd64.deb environment-modules
+
+      - name: Give the test runner user a name to make provenance happy.
+        if: ${{ matrix.step == 'unit' || matrix.step == 'mypy' }}
+        run: sudo usermod -c 'CI Runner' "$(whoami)"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.py-semver }}
+          allow-prereleases: true
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            tox.ini
+
+      - name: Upgrade setuptools and install tox
+        run: |
+          pip install -U pip setuptools wheel
+          pip install "tox<4" "tox-gh-actions<3"
+
+      - name: MyPy cache
+        if: ${{ matrix.step == 'mypy' }}
+        uses: actions/cache@v4
+        with:
+          path: .mypy_cache/${{ env.py-semver }}
+          key: mypy-${{ env.py-semver }}
+
+      - name: Test with tox
+        run: APPTAINER_TMPDIR=${RUNNER_TEMP} tox
+
+      - name: Upload coverage to Codecov
+        if: ${{ matrix.step == 'unit' }}
+        uses: codecov/codecov-action@v5
+        with:
+          fail_ci_if_error: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  tox-style:
+    name: Linters
+    runs-on: ubuntu-24.04
+
+    strategy:
+      matrix:
+        step: [lintreadme, shellcheck, pydocstyle]
+
+    env:
+      py-semver: "3.12"
+      TOXENV: ${{ format('py312-{0}', matrix.step) }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.py-semver }}
+          cache: pip
+
+      - name: Upgrade setuptools and install tox
+        run: |
+          pip install -U pip setuptools wheel
+          pip install "tox<4" "tox-gh-actions<3"
+
+      - if: ${{ matrix.step == 'pydocstyle' && github.event_name == 'pull_request'}}
+        name: Create local branch for diff-quality for PRs
+        run: git branch ${{github.base_ref}} origin/${{github.base_ref}}
+
+      - name: Test with tox
+        run: tox
+
+  clean_working_dir:
+    name: No leftovers
+    runs-on: ubuntu-22.04
+    env:
+      py-semver: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Singularity and environment-modules
+        run: |
+          wget --no-verbose https://github.com/sylabs/singularity/releases/download/v4.2.1/singularity-ce_4.2.1-focal_amd64.deb
+          sudo apt-get install -y ./singularity-ce_4.2.1-focal_amd64.deb environment-modules
+
+      - name: Give the test runner user a name to make provenance happy.
+        run: sudo usermod -c 'CI Runner' "$(whoami)"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.py-semver }}
+          cache: pip
+
+      - name: install with test dependencies
+        run: |
+          pip install -U pip setuptools wheel
+          pip install --no-build-isolation -rtest-requirements.txt .[deps]
+
+      - name: make working directory read-only
+        run: |
+          mkdir .pytest_cache
+          chmod a-w .
+
+      - name: run tests
+        run: APPTAINER_TMPDIR=${RUNNER_TEMP} make test PYTEST_EXTRA=-vvv
+
+
+  conformance_tests:
+    name: CWL conformance
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        cwl-version: [v1.0, v1.1, v1.2]
+        container: [docker, singularity, podman]
+        extras: [""]
+        include:
+          - cwl-version: v1.2
+            container: docker
+            extras: "--fast-parser"
+          - cwl-version: v1.3.0-dev1
+            extras: "--relax-path-checks"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Singularity and environment-modules
+        if: ${{ matrix.container == 'singularity' }}
+        run: |
+          wget --no-verbose https://github.com/sylabs/singularity/releases/download/v4.2.1/singularity-ce_4.2.1-focal_amd64.deb
+          sudo apt-get install -y ./singularity-ce_4.2.1-focal_amd64.deb environment-modules
+
+      - name: Singularity cache
+        if: ${{ matrix.container == 'singularity' }}
+        uses: actions/cache@v4
+        with:
+          path: sifcache
+          key: singularity
+
+      - name: Set up Podman
+        if: ${{ matrix.container == 'podman' }}
+        run: sudo rm -f /usr/bin/docker ; sudo apt-get install -y podman
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12
+          cache: pip
+
+      - name: "Test CWL ${{ matrix.cwl-version }} conformance"
+        env:
+          VERSION: ${{ matrix.cwl-version }}
+          CONTAINER: ${{ matrix.container }}
+          GIT_TARGET: main
+          CWLTOOL_OPTIONS: ${{ matrix.cwl-version == 'v1.2' && '--relax-path-checks' || '' }} ${{ matrix.extras }}
+        run: ./conformance-test.sh
+      - name: Archive test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: cwl-${{ matrix.cwl-version }}-${{ matrix.container }}${{ matrix.extras }}-conformance-results
+          path: |
+            **/cwltool_conf*.xml
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          fail_ci_if_error: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+  release_test:
+    name: cwltool release test
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Singularity and environment-modules
+        run: |
+          wget --no-verbose https://github.com/sylabs/singularity/releases/download/v4.2.1/singularity-ce_4.2.1-focal_amd64.deb
+          sudo apt-get install -y ./singularity-ce_4.2.1-focal_amd64.deb environment-modules
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            test-requirements.txt
+
+      - name: Give the test runner user a name to make provenance happy.
+        run: sudo usermod -c 'CI Runner' "$(whoami)"
+
+      - name: Install packages
+        run: |
+          pip install -U pip setuptools wheel
+          pip install virtualenv
+
+      - name: Release test
+        env:
+          RELEASE_SKIP: head
+        run: ./release-test.sh
+
+  build_test_container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: record cwltool version
+        run: pip install -U setuptools wheel && pip install setuptools_scm[toml] && python setup.py --version
+      - name: build & test cwltool_module container
+        run: ./build-cwltool-docker.sh
+
+  macos:
+    name: Test on macos-latest
+    runs-on: macos-13  # not latest, that is now an Apple Silicon M1, for which seqtk is not yet built on bioconda
+    env:
+      TOXENV: py312-unit
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            tox.ini
+      - name: Upgrade setuptools and install tox
+        run: |
+          pip install -U pip setuptools wheel
+          pip install "tox<4" "tox-gh-actions<3"
+      # # docker for mac install is not currently stable
+      # - name: 'SETUP MacOS: load Homebrew cache'
+      #   uses: actions/cache@v4
+      #   if: runner.os == 'macOS'
+      #   with:
+      #      path: |
+      #        ~/Library/Caches/Homebrew/downloads/*--Docker.dmg
+      #      key: brew-actions-setup-docker-1.0.11
+      #      restore-keys: brew-actions-setup-docker-
+      # - name: setup docker on macos (default stable version)
+      #   uses: docker-practice/actions-setup-docker@master
+      - name: Test with tox
+        run: tox
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          fail_ci_if_error: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

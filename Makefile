@@ -15,8 +15,7 @@
 #
 # Contact: common-workflow-language@googlegroups.com
 
-# make pep8 to check for basic Python code compliance
-# make autopep8 to fix most pep8 errors
+# make format to fix most python formatting errors
 # make pylint to check Python code for enhanced compliance including naming
 #  and documentation
 # make coverage-report to check coverage of the python scripts by the tests
@@ -25,137 +24,195 @@ MODULE=cwltool
 
 # `SHELL=bash` doesn't work for some, so don't use BASH-isms like
 # `[[` conditional expressions.
-PYSOURCES=$(wildcard ${MODULE}/**.py tests/*.py) setup.py
-DEVPKGS=pep8 diff_cover autopep8 pylint coverage pep257 flake8
-DEBDEVPKGS=pep8 python-autopep8 pylint python-coverage pep257 sloccount python-flake8
-VERSION=1.0.$(shell date +%Y%m%d%H%M%S --date=`git log --first-parent \
-	--max-count=1 --format=format:%cI`)
+PYSOURCES=$(wildcard ${MODULE}/**.py cwltool/cwlprov/*.py tests/*.py tests/cwl-conformance/*.py) setup.py
+DEVPKGS=diff_cover pylint pep257 pydocstyle 'tox<4' tox-pyenv auto-walrus \
+	isort wheel autoflake pyupgrade bandit -rlint-requirements.txt\
+	-rtest-requirements.txt -rmypy-requirements.txt -rdocs/requirements.txt
+DEBDEVPKGS=pep8 python-autopep8 pylint python-coverage pydocstyle sloccount \
+	   python-flake8 python-mock shellcheck
+
+VERSION=3.1.$(shell TZ=UTC git log --first-parent --max-count=1 \
+	--format=format:%cd --date=format-local:%Y%m%d%H%M%S)
 mkfile_dir := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+UNAME_S=$(shell uname -s)
 
-## all         : default task
-all:
-	./setup.py develop
+## all                    : default task (install cwltool in dev mode)
+all: dev
 
-## help        : print this help message and exit
+## help                   : print this help message and exit
 help: Makefile
 	@sed -n 's/^##//p' $<
 
-## install-dep : install most of the development dependencies via pip
-install-dep:
-	pip install --upgrade $(DEVPKGS)
+## cleanup                : shortcut for "make sort_imports format flake8 diff_pydocstyle_report"
+cleanup: sort_imports format flake8 diff_pydocstyle_report
 
-## install-deb-dep: install most of the dev dependencies via apt-get
+## install-dep            : install most of the development dependencies via pip
+install-dep: install-dependencies
+
+install-dependencies: FORCE
+	pip install --upgrade $(DEVPKGS)
+	pip install -r requirements.txt
+
+install-doc-dep:
+	pip install -r docs/requirements.txt
+
+## install-deb-dep        : install many of the dev dependencies via apt-get
 install-deb-dep:
 	sudo apt-get install $(DEBDEVPKGS)
 
-## install     : install the ${MODULE} module and schema-salad-tool
+## install                : install the cwltool module with the "deps" dependency (galaxy-tool-util)
 install: FORCE
-	./setup.py build install
+	pip install .[deps]
 
-## dist        : create a module package for distribution
+## dev                    : install the cwltool module in dev mode
+dev: install-dep
+	pip install -e .[deps]
+
+
+## dist                   : create a module package for distribution
 dist: dist/${MODULE}-$(VERSION).tar.gz
 
 dist/${MODULE}-$(VERSION).tar.gz: $(SOURCES)
-	./setup.py sdist
+	python3 -m build
 
-## clean       : clean up all temporary / machine-generated files
+## docs                   : make the docs
+docs: FORCE
+	cd docs && $(MAKE) html
+
+## clean                  : clean up all temporary / machine-generated files
 clean: FORCE
-	rm -f ${MODILE}/*.pyc tests/*.pyc
-	./setup.py clean --all || true
+	rm -f ${MODULE}/*.pyc tests/*.pyc *.so ${MODULE}/*.so cwltool/cwlprov/*.so
+	rm -Rf ${MODULE}/__pycache__/
+	rm -Rf build
 	rm -Rf .coverage
 	rm -f diff-cover.html
 
-## pep8        : check Python code style
-pep8: $(PYSOURCES)
-	pep8 --exclude=_version.py  --show-source --show-pep8 $^ || true
+# Linting and code style related targets
+## sort_import            : sorting imports using isort: https://github.com/timothycrosley/isort
+sort_imports: $(PYSOURCES) mypy-stubs
+	isort $^
 
-pep8_report.txt: $(PYSOURCES)
-	pep8 --exclude=_version.py $^ > pep8_report.txt || true
+remove_unused_imports: $(PYSOURCES)
+	autoflake --in-place --remove-all-unused-imports $^
 
-diff_pep8_report: pep8_report.txt
-	diff-quality --violations=pep8 pep8_report.txt
+pep257: pydocstyle
+## pydocstyle             : check Python docstring style
+pydocstyle: $(PYSOURCES)
+	pydocstyle --add-ignore=D100,D101,D102,D103 $^ || true
 
-## pep257      : check Python code style
-pep257: $(PYSOURCES)
-	pep257 --ignore=D100,D101,D102,D103 $^ || true
+pydocstyle_report.txt: $(PYSOURCES)
+	pydocstyle setup.py $^ > $@ 2>&1 || true
 
-pep257_report.txt: $(PYSOURCES)
-	pep257 setup.py $^ > pep257_report.txt 2>&1 || true
+## diff_pydocstyle_report : check Python docstring style for changed files only
+diff_pydocstyle_report: pydocstyle_report.txt
+	diff-quality --compare-branch=main --violations=pydocstyle --fail-under=100 $^
 
-diff_pep257_report: pep257_report.txt
-	diff-quality --violations=pep8 pep257_report.txt
+## codespell-check        : check for common misspellings
+codespell-check:
+	@codespell $(shell git ls-files | grep -v cwltool/schemas | grep -v cwltool/jshint/ | grep -v mypy-stubs) \
+		|| (echo Probable typo foun. Run \"make codespell-fix\" to accept suggested fixes, or add the word to the ignore list in setup.cfg ; exit 1)
 
-## autopep8    : fix most Python code indentation and formatting
-autopep8: $(PYSOURCES)
-	autopep8 --recursive --in-place --ignore E309 $^
+## codespell-fix          : fix common misspellings
+codespell-fix:
+	@codespell -w $(shell git ls-files | grep -v cwltool/schemas | grep -v cwltool/jshint/ | grep -v mypy-stubs)
 
-# A command to automatically run astyle and autopep8 on appropriate files
-## format      : check/fix all code indentation and formatting (runs autopep8)
-format: autopep8
-	# Do nothing
+## format                 : check/fix all code indentation and formatting (runs black)
+format:
+	black --exclude cwltool/schemas --exclude cwltool/_version.py setup.py cwltool.py cwltool tests mypy-stubs
 
-## pylint      : run static code analysis on Python code
+format-check:
+	black --diff --check --exclude cwltool/schemas setup.py --exclude cwltool/_version.py cwltool.py cwltool tests mypy-stubs
+
+## pylint                 : run static code analysis on Python code
 pylint: $(PYSOURCES)
 	pylint --msg-template="{path}:{line}: [{msg_id}({symbol}), {obj}] {msg}" \
-                $^ || true
+                $^ -j0|| true
 
-pylint_report.txt: ${PYSOURCES}
+pylint_report.txt: $(PYSOURCES)
 	pylint --msg-template="{path}:{line}: [{msg_id}({symbol}), {obj}] {msg}" \
-		$^ > pylint_report.txt || true
+		$^ -j0> $@ || true
 
 diff_pylint_report: pylint_report.txt
-	diff-quality --violations=pylint pylint_report.txt
+	diff-quality --compare-branch=main --violations=pylint pylint_report.txt
 
-.coverage: $(PYSOURCES) all
-	export COVERAGE_PROCESS_START=${mkfile_dir}.coveragerc; \
-	       cd ${CWL}; ./run_test.sh RUNNER=cwltool
-	coverage run setup.py test
-	coverage combine ${CWL} ${CWL}/draft-3/ ./
+.coverage: testcov
+
+coverage: .coverage
+	coverage report
 
 coverage.xml: .coverage
-	python-coverage xml
+	coverage xml
 
 coverage.html: htmlcov/index.html
 
 htmlcov/index.html: .coverage
-	python-coverage html
+	coverage html
 	@echo Test coverage of the Python code is now in htmlcov/index.html
 
 coverage-report: .coverage
-	python-coverage report
+	coverage report
 
-diff-cover: coverage-gcovr.xml coverage.xml
-	diff-cover coverage-gcovr.xml coverage.xml
+diff-cover: coverage.xml
+	diff-cover --compare-branch=main $^
 
-diff-cover.html: coverage-gcovr.xml coverage.xml
-	diff-cover coverage-gcovr.xml coverage.xml \
-		--html-report diff-cover.html
+diff-cover.html: coverage.xml
+	diff-cover --compare-branch=main $^ --html-report $@
 
-## test        : run the ${MODULE} test suite
-test: FORCE
-	python tests/test_examples.py 
+## test                   : run the cwltool test suite
+test: $(PYSOURCES)
+	python3 -m pytest -rsfE ${PYTEST_EXTRA}
 
-sloccount.sc: ${PYSOURCES} Makefile
-	sloccount --duplicates --wide --details $^ > sloccount.sc
+## testcov                : run the cwltool test suite and collect coverage
+testcov: $(PYSOURCES)
+	python3 -m pytest -rsfE --cov --cov-config=.coveragerc --cov-report= ${PYTEST_EXTRA}
 
-## sloccount   : count lines of code
-sloccount: ${PYSOURCES} Makefile
+sloccount.sc: $(PYSOURCES) Makefile
+	sloccount --duplicates --wide --details $^ > $@
+
+## sloccount              : count lines of code
+sloccount: $(PYSOURCES) Makefile
 	sloccount $^
 
 list-author-emails:
 	@echo 'name, E-Mail Address'
 	@git log --format='%aN,%aE' | sort -u | grep -v 'root'
 
+mypy3: mypy
+mypy: $(PYSOURCES)
+	MYPYPATH=$$MYPYPATH:mypy-stubs mypy $^
 
-mypy: ${PYSOURCES}
-	rm -Rf typeshed/2.7/ruamel/yaml
-	ln -s $(shell python -c 'from __future__ import print_function; import ruamel.yaml; import os.path; print(os.path.dirname(ruamel.yaml.__file__))') \
-		typeshed/2.7/ruamel/yaml
-	rm -Rf typeshed/2.7/schema_salad
-	ln -s $(shell python -c 'from __future__ import print_function; import schema_salad; import os.path; print(os.path.dirname(schema_salad.__file__))') \
-		typeshed/2.7/schema_salad
-	MYPYPATH=typeshed/2.7 mypy --py2 --disallow-untyped-calls \
-		 --warn-redundant-casts --warn-unused-ignores --fast-parser \
-		 cwltool
+mypyc: $(PYSOURCES)
+	MYPYPATH=mypy-stubs CWLTOOL_USE_MYPYC=1 pip install --verbose -e . \
+		 && pytest -rsfE -vv ${PYTEST_EXTRA}
+
+shellcheck: FORCE
+	shellcheck build-cwltool-docker.sh cwl-docker.sh release-test.sh conformance-test.sh \
+		cwltool-in-docker.sh
+
+pyupgrade: $(PYSOURCES)
+	pyupgrade --exit-zero-even-if-changed --py39-plus $^
+	auto-walrus $^
+
+release-test: FORCE
+	git diff-index --quiet HEAD -- || ( echo You have uncommitted changes, please commit them and try again; false )
+	./release-test.sh
+
+release:
+	export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_CWLTOOL=${VERSION} && \
+	./release-test.sh && \
+	. testenv2/bin/activate && \
+		pip install build && \
+		python3 -m build testenv2/src/${MODULE} && \
+		pip install twine && \
+		twine upload testenv2/src/${MODULE}/dist/* && \
+		git tag ${VERSION} && git push --tags
+
+flake8: $(PYSOURCES)
+	flake8 $^
 
 FORCE:
+
+# Use this to print the value of a Makefile variable
+# Example `make print-VERSION`
+# From https://www.cmcrossroads.com/article/printing-value-makefile-variable
+print-%  : ; @echo $* = $($*)

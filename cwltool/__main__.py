@@ -1,4 +1,5 @@
-from . import main
-import sys
+"""Default entrypoint for the cwltool module."""
 
-sys.exit(main.main())
+from . import main
+
+main.run()

@@ -1,3 +1,4 @@
+#!/usr/bin/env cwl-runner
 cwlVersion: v1.0
 class: Workflow
 inputs: []
@@ -11,6 +12,7 @@ steps:
     out: [c]
     run:
       class: CommandLineTool
+      id: subtool
       inputs: []
       outputs:
         b:
@@ -24,6 +26,7 @@ steps:
     out: [c]
     run:
       class: CommandLineTool
+      id: subtool
       inputs:
         a: string
       outputs:
